@@ -1404,48 +1404,69 @@ jobs:
           # Dashboard
           # ----------------------------------------------------------
 
+          $AnyDeskDisplayId = if ([string]::IsNullOrWhiteSpace($AnyDeskId)) {
+          "NOT DETECTED"
+          }
+          else {
+          $AnyDeskId
+          }
+
+          $AnyDeskDisplayStatus = if ([string]::IsNullOrWhiteSpace($AnyDeskStatus)) {
+          "NOT DETECTED"
+          }
+          else {
+          $AnyDeskStatus
+          }
+
+          $PublicUrlDisplay = if ([string]::IsNullOrWhiteSpace($publicUrl)) {
+          "NOT AVAILABLE"
+          }
+          else {
+          $publicUrl
+          }
+
           $dashboard = @"
-==============================================
-        DAO WINDOWS DESKTOP
-==============================================
+          ==============================================
+          DAO WINDOWS DESKTOP
+          ==============================================
 
-Workspace:
-$Workspace
+          Workspace:
+          $Workspace
 
-TightVNC:
-Status: RUNNING
-TCP: $VncPort
+          TightVNC:
+          Status: RUNNING
+          TCP: $VncPort
 
-noVNC:
-Status: RUNNING
-TCP: $WebPort
+          noVNC:
+          Status: RUNNING
+          TCP: $WebPort
 
-Cloudflare:
-Status: RUNNING
+          Playit:
+          Status: RUNNING
 
-Public noVNC URL:
-$publicUrl
+          Public noVNC URL:
+          $PublicUrlDisplay
 
-AnyDesk:
-Status: $AnyDeskStatus
-ID: $(if ($AnyDeskId) { $AnyDeskId } else { "NOT DETECTED" })
+          AnyDesk:
+          Status: $AnyDeskDisplayStatus
+          ID: $AnyDeskDisplayId
 
-Passwords:
-Not displayed or written to dashboard.
+          Passwords:
+          Not displayed or written to dashboard.
 
-==============================================
-"@
+          ==============================================
+          "@
 
           Set-Content `
-            -LiteralPath $Connection `
-            -Value $dashboard `
-            -Encoding UTF8
+          -LiteralPath $Connection `
+          -Value $dashboard `
+          -Encoding UTF8
 
           Write-Host ""
           Write-Host $dashboard
+          Write-Host ""
 
           Write-Host "[OK] DAO desktop initialization completed."
-
       # ============================================================
       # 11. INITIAL DASHBOARD
       # ============================================================
