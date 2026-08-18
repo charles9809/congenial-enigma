@@ -29,7 +29,7 @@ jobs:
       RUNTIME_MINUTES: "300"
 
       NOVNC_DIR: "C:\noVNC"
-      ANYDESK_DIR: "C:\Program Files (x86)\AnyDesk"
+      ANYDESK_DIR: 'C:\Program Files (x86)\AnyDesk'
 
     steps:
 
