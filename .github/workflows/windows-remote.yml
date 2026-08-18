@@ -28,16 +28,14 @@ jobs:
       CLAIM_TIMEOUT_SECONDS: "120"
       RUNTIME_MINUTES: "300"
 
-      ANYDESK_URL: "https://download.anydesk.com/AnyDesk.exe"
-
-      NOVNC_VERSION: "v1.7.0"
-      WEBSOCKIFY_VERSION: "0.13.0"
+      NOVNC_DIR: "C:\noVNC"
+      ANYDESK_DIR: "C:\Program Files (x86)\AnyDesk"
 
     steps:
 
-      # ==========================================================
-      # 1. WINDOWS SERVER VALIDATION
-      # ==========================================================
+      # ============================================================
+      # 1. WINDOWS VALIDATION
+      # ============================================================
 
       - name: Validate Windows Server 2025
         shell: pwsh
@@ -47,7 +45,7 @@ jobs:
           $os = Get-CimInstance Win32_OperatingSystem
           $cs = Get-CimInstance Win32_ComputerSystem
 
-          Write-Host "Operating System: $($os.Caption)"
+          Write-Host "OS: $($os.Caption)"
           Write-Host "Version: $($os.Version)"
           Write-Host "Build: $($os.BuildNumber)"
           Write-Host "Architecture: $($cs.SystemType)"
@@ -58,13 +56,14 @@ jobs:
 
           if ($cs.SystemType -notmatch "x64") {
               throw "This workflow requires x64 Windows."
+
           }
 
-      # ==========================================================
-      # 2. PASSWORD VALIDATION
-      # ==========================================================
+      # ============================================================
+      # 2. RDP PASSWORD
+      # ============================================================
 
-      - name: Validate RDP_PASSWORD
+      - name: Validate RDP password
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -81,11 +80,11 @@ jobs:
 
           Write-Host "RDP_PASSWORD is configured."
 
-      # ==========================================================
-      # 3. REMOVE EXISTING PLAYIT
-      # ==========================================================
+      # ============================================================
+      # 3. CLEAN OLD PLAYIT
+      # ============================================================
 
-      - name: Remove existing Playit installation
+      - name: Remove previous Playit installation
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
@@ -99,7 +98,8 @@ jobs:
               }
 
           foreach ($service in $services) {
-              Write-Host "Stopping Playit service: $($service.Name)"
+
+              Write-Host "Stopping $($service.Name)"
 
               Stop-Service `
                   -Name $service.Name `
@@ -107,16 +107,17 @@ jobs:
                   -ErrorAction SilentlyContinue
           }
 
-          $uninstallEntries = @()
+          $entries = @()
 
-          $registryPaths = @(
+          $paths = @(
               "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
               "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
               "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
           )
 
-          foreach ($path in $registryPaths) {
-              $uninstallEntries += Get-ItemProperty `
+          foreach ($path in $paths) {
+
+              $entries += Get-ItemProperty `
                   -Path $path `
                   -ErrorAction SilentlyContinue |
                   Where-Object {
@@ -124,15 +125,13 @@ jobs:
                   }
           }
 
-          foreach ($entry in $uninstallEntries) {
+          foreach ($entry in $entries) {
 
-              Write-Host "Found installed Playit: $($entry.DisplayName)"
+              Write-Host "Found: $($entry.DisplayName)"
 
               if ($entry.PSChildName -match "^\{.+\}$") {
 
-                  Write-Host "Uninstalling MSI product $($entry.PSChildName)"
-
-                  $process = Start-Process `
+                  $p = Start-Process `
                       -FilePath "msiexec.exe" `
                       -ArgumentList @(
                           "/x",
@@ -144,83 +143,191 @@ jobs:
                       -PassThru `
                       -WindowStyle Hidden
 
-                  if ($process.ExitCode -notin @(0,1605,3010)) {
-                      throw "Playit MSI uninstall failed. Exit code: $($process.ExitCode)"
-                  }
-              }
-              elseif ($entry.UninstallString) {
-
-                  Write-Host "Using registered uninstall command."
-
-                  $command = $entry.UninstallString
-
-                  if ($command -match "msiexec") {
-                      $command = $command -replace "/I", "/X"
-                      $command = $command -replace "/i", "/x"
-
-                      Start-Process `
-                          -FilePath "cmd.exe" `
-                          -ArgumentList "/c", "$command /qn /norestart" `
-                          -Wait `
-                          -WindowStyle Hidden
+                  if ($p.ExitCode -notin @(0,1605,3010)) {
+                      Write-Warning "Playit uninstall returned $($p.ExitCode)"
                   }
               }
           }
 
           Start-Sleep -Seconds 3
 
-          $remaining = Get-ChildItem `
-              -Path "$env:ProgramFiles","${env:ProgramFiles(x86)}","$env:LOCALAPPDATA" `
-              -Filter "playit.exe" `
-              -File `
-              -Recurse `
-              -ErrorAction SilentlyContinue
-
-          foreach ($file in $remaining) {
-              Write-Host "Removing old Playit executable: $($file.FullName)"
-
-              Remove-Item `
-                  -Path $file.FullName `
-                  -Force `
-                  -ErrorAction SilentlyContinue
-          }
-
-          Write-Host "Existing Playit cleanup completed."
-
-      # ==========================================================
-      # 4. DOWNLOAD OFFICIAL PLAYIT 1.0.10 MSI
-      # ==========================================================
+      # ============================================================
+      # 4. DOWNLOAD PLAYIT
+      # ============================================================
 
       - name: Download Playit 1.0.10
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
+          $url = $env:PLAYIT_MSI_URL
+
           $installer = Join-Path `
               $env:RUNNER_TEMP `
               "playit-windows-x86_64-signed-1.0.10.msi"
 
-          Invoke-WebRequest `
-              -Uri $env:PLAYIT_MSI_URL `
-              -OutFile $installer
+          Remove-Item `
+              $installer `
+              -Force `
+              -ErrorAction SilentlyContinue
 
-          if (-not (Test-Path $installer)) {
-              throw "Playit MSI was not downloaded."
+          [Net.ServicePointManager]::SecurityProtocol = `
+              [Net.SecurityProtocolType]::Tls12
+
+          $downloaded = $false
+
+          # --------------------------------------------------------
+          # Method 1: curl.exe
+          # --------------------------------------------------------
+
+          for ($attempt = 1; $attempt -le 4; $attempt++) {
+
+              Write-Host ""
+              Write-Host "Playit download using curl - attempt $attempt/4"
+
+              Remove-Item `
+                  $installer `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+              try {
+
+                  & curl.exe `
+                      --fail `
+                      --location `
+                      --retry 3 `
+                      --retry-delay 5 `
+                      --connect-timeout 30 `
+                      --max-time 180 `
+                      --user-agent "GitHubActions-Playit" `
+                      --output $installer `
+                      $url
+
+                  if ($LASTEXITCODE -eq 0 -and (Test-Path $installer)) {
+
+                      $size = (Get-Item $installer).Length
+
+                      Write-Host "Downloaded: $size bytes"
+
+                      if ($size -gt 100000) {
+                          $downloaded = $true
+                          break
+                      }
+                  }
+
+              }
+              catch {
+
+                  Write-Warning $_.Exception.Message
+              }
+
+              Start-Sleep -Seconds 5
           }
 
-          $size = (Get-Item $installer).Length
+          # --------------------------------------------------------
+          # Method 2: Invoke-WebRequest fallback
+          # --------------------------------------------------------
 
-          if ($size -lt 100000) {
-              throw "Downloaded Playit MSI appears invalid."
+          if (-not $downloaded) {
+
+              Write-Host ""
+              Write-Host "curl download failed."
+              Write-Host "Trying PowerShell Invoke-WebRequest..."
+
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+
+                  Write-Host "PowerShell download attempt $attempt/3"
+
+                  Remove-Item `
+                      $installer `
+                      -Force `
+                      -ErrorAction SilentlyContinue
+
+                  try {
+
+                      Invoke-WebRequest `
+                          -Uri $url `
+                          -OutFile $installer `
+                          -UseBasicParsing `
+                          -TimeoutSec 180 `
+                          -Headers @{
+                              "User-Agent" = "GitHubActions-Playit"
+                              "Accept" = "*/*"
+                          }
+
+                      if (Test-Path $installer) {
+
+                          $size = (Get-Item $installer).Length
+
+                          Write-Host "Downloaded: $size bytes"
+
+                          if ($size -gt 100000) {
+                              $downloaded = $true
+                              break
+                          }
+                      }
+
+                  }
+                  catch {
+
+                      Write-Warning `
+                          "Download failed: $($_.Exception.Message)"
+                  }
+
+                  Start-Sleep -Seconds 5
+              }
           }
+
+          if (-not $downloaded) {
+
+              Write-Host ""
+              Write-Host "============================================"
+              Write-Host "PLAYIT DOWNLOAD FAILED"
+              Write-Host "============================================"
+              Write-Host ""
+              Write-Host "The runner could not download:"
+              Write-Host $url
+              Write-Host ""
+              Write-Host "DNS information:"
+              Resolve-DnsName builds.playit.gg `
+                  -ErrorAction SilentlyContinue |
+                  Format-Table -AutoSize
+              Write-Host ""
+              Write-Host "Testing HTTPS connectivity..."
+
+              try {
+                  Test-NetConnection `
+                      builds.playit.gg `
+                      -Port 443 `
+                      -InformationLevel Detailed
+              }
+              catch {
+                  Write-Warning $_.Exception.Message
+              }
+
+              throw "Unable to download Playit 1.0.10 from builds.playit.gg."
+          }
+
+          # --------------------------------------------------------
+          # Authenticode
+          # --------------------------------------------------------
 
           $signature = Get-AuthenticodeSignature $installer
 
-          Write-Host "Signature status: $($signature.Status)"
-          Write-Host "Signer: $($signature.SignerCertificate.Subject)"
+          Write-Host "Signature: $($signature.Status)"
+
+          if ($signature.SignerCertificate) {
+              Write-Host "Signer: $($signature.SignerCertificate.Subject)"
+          }
 
           if ($signature.Status -ne "Valid") {
-              throw "Playit MSI Authenticode signature is not valid."
+
+              Remove-Item `
+                  $installer `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+              throw "Playit MSI signature is not valid."
           }
 
           "PLAYIT_INSTALLER=$installer" | Out-File `
@@ -228,16 +335,18 @@ jobs:
               -Encoding utf8 `
               -Append
 
-      # ==========================================================
-      # 5. INSTALL PLAYIT MSI
-      # ==========================================================
+      # ============================================================
+      # 5. INSTALL PLAYIT
+      # ============================================================
 
-      - name: Install Playit 1.0.10 MSI
+      - name: Install Playit 1.0.10
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $process = Start-Process `
+          Write-Host "Installing Playit 1.0.10..."
+
+          $p = Start-Process `
               -FilePath "msiexec.exe" `
               -ArgumentList @(
                   "/i",
@@ -249,45 +358,48 @@ jobs:
               -PassThru `
               -WindowStyle Hidden
 
-          if ($process.ExitCode -notin @(0,3010)) {
-              throw "Playit MSI installation failed. Exit code: $($process.ExitCode)"
+          if ($p.ExitCode -notin @(0,3010)) {
+              throw "Playit MSI installation failed. Exit code: $($p.ExitCode)"
           }
 
           Start-Sleep -Seconds 5
 
-      # ==========================================================
-      # 6. FIND REAL PLAYIT.EXE
-      # ==========================================================
+      # ============================================================
+      # 6. FIND PLAYIT.EXE
+      # ============================================================
 
-      - name: Locate real playit.exe
+      - name: Locate Playit executable
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $candidates = @()
+          $found = @()
 
-          $command = Get-Command playit.exe -ErrorAction SilentlyContinue
+          $command = Get-Command `
+              playit.exe `
+              -ErrorAction SilentlyContinue
 
           if ($command) {
-              $candidates += $command.Source
+              $found += $command.Source
           }
 
-          $commonPaths = @(
+          $paths = @(
               "$env:ProgramFiles\playit\playit.exe",
               "$env:ProgramFiles\Playit\playit.exe",
               "$env:ProgramFiles(x86)\playit\playit.exe",
               "$env:ProgramFiles(x86)\Playit\playit.exe",
-              "$env:LOCALAPPDATA\Programs\playit\playit.exe",
+              "$env:LOCALAPPDATA\playit_gg\playit.exe",
               "$env:LOCALAPPDATA\Playit\playit.exe"
           )
 
-          foreach ($path in $commonPaths) {
+          foreach ($path in $paths) {
+
               if (Test-Path $path) {
-                  $candidates += $path
+                  $found += $path
               }
           }
 
-          if (-not $candidates) {
+          if (-not $found) {
 
               $found = Get-ChildItem `
                   -Path "$env:ProgramFiles","${env:ProgramFiles(x86)}","$env:LOCALAPPDATA" `
@@ -296,43 +408,44 @@ jobs:
                   -Recurse `
                   -ErrorAction SilentlyContinue |
                   Select-Object -First 1 -ExpandProperty FullName
-
-              if ($found) {
-                  $candidates += $found
-              }
           }
 
-          $playit = $candidates |
-              Where-Object { Test-Path $_ } |
+          $playit = $found |
+              Where-Object {
+                  Test-Path $_
+              } |
               Select-Object -First 1
 
           if (-not $playit) {
-              throw "playit.exe was not found after installing Playit 1.0.10."
+              throw "playit.exe was not found after installation."
           }
-
-          $version = & $playit version 2>$null
 
           Write-Host "Playit executable:"
           Write-Host $playit
 
+          Write-Host ""
           Write-Host "Playit version:"
-          Write-Host $version
+          & $playit version
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Playit version command failed."
+          }
 
           "PLAYIT_EXE=$playit" | Out-File `
               -FilePath $env:GITHUB_ENV `
               -Encoding utf8 `
               -Append
 
-      # ==========================================================
-      # 7. VERIFY REAL PLAYIT CLI
-      # ==========================================================
+      # ============================================================
+      # 7. CHECK CURRENT CLI
+      # ============================================================
 
-      - name: Verify Playit CLI syntax
+      - name: Verify Playit CLI
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "========== playit --help =========="
+          Write-Host "========== PLAYIT HELP =========="
 
           & $env:PLAYIT_EXE --help
 
@@ -341,7 +454,7 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "========== playit claim --help =========="
+          Write-Host "========== CLAIM HELP =========="
 
           & $env:PLAYIT_EXE claim --help
 
@@ -350,7 +463,7 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "========== playit claim exchange --help =========="
+          Write-Host "========== CLAIM EXCHANGE HELP =========="
 
           & $env:PLAYIT_EXE claim exchange --help
 
@@ -358,40 +471,37 @@ jobs:
               throw "playit claim exchange --help failed."
           }
 
-          Write-Host ""
-          Write-Host "Verified: no --secret_path argument is being used."
+      # ============================================================
+      # 8. GENERATE CLAIM
+      # ============================================================
 
-      # ==========================================================
-      # 8. GENERATE CLAIM CODE
-      # ==========================================================
-
-      - name: Generate Playit Claim URL
+      - name: Generate Playit Claim
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $claimCode = (& $env:PLAYIT_EXE --stdout claim generate).Trim()
+          $code = (& $env:PLAYIT_EXE claim generate).Trim()
 
-          if ([string]::IsNullOrWhiteSpace($claimCode)) {
-              throw "Playit did not return a Claim Code."
+          if ([string]::IsNullOrWhiteSpace($code)) {
+              throw "Playit did not return a claim code."
           }
 
-          if ($claimCode -notmatch "^[0-9a-fA-F]{10}$") {
-              throw "Unexpected Playit Claim Code format."
+          if ($code -notmatch "^[0-9a-fA-F]{10}$") {
+              throw "Unexpected Playit claim code format."
           }
 
-          $claimUrl = (& $env:PLAYIT_EXE --stdout claim url $claimCode).Trim()
+          $url = (& $env:PLAYIT_EXE claim url $code).Trim()
 
-          if ($claimUrl -notmatch "^https://playit\.gg/claim/[0-9a-fA-F]+$") {
-              throw "Unexpected Playit Claim URL."
+          if ($url -notmatch "^https://playit\.gg/claim/[0-9a-fA-F]+$") {
+              throw "Unexpected Playit claim URL."
           }
 
-          "PLAYIT_CLAIM_CODE=$claimCode" | Out-File `
+          "PLAYIT_CLAIM_CODE=$code" | Out-File `
               -FilePath $env:GITHUB_ENV `
               -Encoding utf8 `
               -Append
 
-          "PLAYIT_CLAIM_URL=$claimUrl" | Out-File `
+          "PLAYIT_CLAIM_URL=$url" | Out-File `
               -FilePath $env:GITHUB_ENV `
               -Encoding utf8 `
               -Append
@@ -404,68 +514,49 @@ jobs:
 
           ## Claim URL
 
-          $claimUrl
+          $url
 
           ## Claim Code
 
-          `$claimCode`
+          `$code`
 
           ## Status
 
           ⏳ Waiting for claim...
 
-          **Claim timeout: exactly 2 minutes.**
+          **Timeout: 120 seconds**
 
           "@
 
-      # ==========================================================
-      # 9. EXECUTE PLAYIT.EXE AND CAPTURE SCREEN
-      # ==========================================================
+      # ============================================================
+      # 9. START PLAYIT AGENT / SERVICE
+      # ============================================================
 
-      - name: Start Playit executable
+      - name: Start Playit Agent
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $playitLog = Join-Path `
-              $env:RUNNER_TEMP `
-              "playit-runtime.log"
+          Write-Host "Starting Playit agent..."
 
-          Remove-Item `
-              $playitLog `
-              -Force `
-              -ErrorAction SilentlyContinue
+          & $env:PLAYIT_EXE start
 
-          $arguments = @(
-              "--stdout"
-          )
-
-          $process = Start-Process `
-              -FilePath $env:PLAYIT_EXE `
-              -ArgumentList $arguments `
-              -RedirectStandardOutput $playitLog `
-              -RedirectStandardError "$playitLog.err" `
-              -PassThru `
-              -WindowStyle Hidden
-
-          $process.Id | Out-File `
-              -FilePath "$env:RUNNER_TEMP\playit.pid" `
-              -Encoding ascii
+          if ($LASTEXITCODE -ne 0) {
+              Write-Warning "playit start returned exit code $LASTEXITCODE"
+          }
 
           Start-Sleep -Seconds 5
 
-          if ($process.HasExited) {
-              throw "Playit executable exited unexpectedly."
-          }
+          Write-Host ""
+          Write-Host "Playit status:"
 
-          Write-Host "Playit executable is running."
-          Write-Host "PID: $($process.Id)"
+          & $env:PLAYIT_EXE status
 
-      # ==========================================================
-      # 10. PLAYIT SCREENSHOT
-      # ==========================================================
+      # ============================================================
+      # 10. CAPTURE PLAYIT SCREEN
+      # ============================================================
 
-      - name: Capture Playit desktop screenshot
+      - name: Capture Playit screenshot
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -473,7 +564,7 @@ jobs:
           Add-Type -AssemblyName System.Drawing
           Add-Type -AssemblyName System.Windows.Forms
 
-          $screenshot = Join-Path `
+          $output = Join-Path `
               $env:GITHUB_WORKSPACE `
               "playit.png"
 
@@ -483,10 +574,29 @@ jobs:
               throw "No Windows display was detected."
           }
 
-          $left = ($screens | ForEach-Object { $_.Bounds.Left } | Measure-Object -Minimum).Minimum
-          $top = ($screens | ForEach-Object { $_.Bounds.Top } | Measure-Object -Minimum).Minimum
-          $right = ($screens | ForEach-Object { $_.Bounds.Right } | Measure-Object -Maximum).Maximum
-          $bottom = ($screens | ForEach-Object { $_.Bounds.Bottom } | Measure-Object -Maximum).Maximum
+          $left = (
+              $screens |
+              ForEach-Object { $_.Bounds.Left } |
+              Measure-Object -Minimum
+          ).Minimum
+
+          $top = (
+              $screens |
+              ForEach-Object { $_.Bounds.Top } |
+              Measure-Object -Minimum
+          ).Minimum
+
+          $right = (
+              $screens |
+              ForEach-Object { $_.Bounds.Right } |
+              Measure-Object -Maximum
+          ).Maximum
+
+          $bottom = (
+              $screens |
+              ForEach-Object { $_.Bounds.Bottom } |
+              Measure-Object -Maximum
+          ).Maximum
 
           $width = [int]($right - $left)
           $height = [int]($bottom - $top)
@@ -495,14 +605,17 @@ jobs:
               throw "Invalid display dimensions."
           }
 
-          $bitmap = New-Object System.Drawing.Bitmap `
-              $width,
-              $height,
-              ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+          $bitmap = New-Object `
+              System.Drawing.Bitmap(
+                  $width,
+                  $height,
+                  [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+              )
 
           $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 
           try {
+
               $graphics.CopyFromScreen(
                   $left,
                   $top,
@@ -513,40 +626,23 @@ jobs:
               )
 
               $bitmap.Save(
-                  $screenshot,
+                  $output,
                   [System.Drawing.Imaging.ImageFormat]::Png
               )
+
           }
           finally {
+
               $graphics.Dispose()
               $bitmap.Dispose()
+
           }
 
-          if (-not (Test-Path $screenshot)) {
+          if (-not (Test-Path $output)) {
               throw "Playit screenshot was not created."
           }
 
-          $size = (Get-Item $screenshot).Length
-
-          if ($size -lt 1024) {
-              throw "Playit screenshot is invalid or empty."
-          }
-
           Write-Host "Playit screenshot created."
-          Write-Host "File: $screenshot"
-          Write-Host "Size: $size bytes"
-
-          Add-Content `
-              -Path $env:GITHUB_STEP_SUMMARY `
-              -Value @"
-
-          ## 📸 Playit Screenshot
-
-          Screenshot captured immediately after starting `playit.exe`.
-
-          The image is available in the **Playit Screenshot** artifact.
-
-          "@
 
       - name: Upload Playit screenshot
         uses: actions/upload-artifact@v4
@@ -556,37 +652,33 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # ==========================================================
-      # 11. WAIT FOR CLAIM - EXACTLY 120 SECONDS
-      # ==========================================================
+      # ============================================================
+      # 11. WAIT FOR CLAIM
+      # ============================================================
 
       - name: Wait for Playit Claim
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $secretFile = Join-Path `
-              $env:RUNNER_TEMP `
-              "playit-secret.txt"
-
-          Remove-Item `
-              $secretFile `
-              -Force `
-              -ErrorAction SilentlyContinue
-
           Write-Host ""
-          Write-Host "============================================="
+          Write-Host "=============================================="
           Write-Host "PLAYIT CLAIM"
-          Write-Host "============================================="
-          Write-Host "Claim URL:"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Open this URL:"
           Write-Host $env:PLAYIT_CLAIM_URL
           Write-Host ""
+          Write-Host "Claim code:"
+          Write-Host $env:PLAYIT_CLAIM_CODE
+          Write-Host ""
           Write-Host "Waiting exactly 120 seconds..."
-          Write-Host "============================================="
+          Write-Host "=============================================="
 
-          $exchangeOutput = & `
+          $secret = $null
+
+          $result = & `
               $env:PLAYIT_EXE `
-              --stdout `
               claim `
               exchange `
               $env:PLAYIT_CLAIM_CODE `
@@ -595,61 +687,55 @@ jobs:
 
           $exitCode = $LASTEXITCODE
 
-          if ($exchangeOutput) {
-              $exchangeOutput |
-                  ForEach-Object {
-                      $line = $_.ToString()
+          if ($result) {
 
-                      if ($line -match "secret|key|token") {
-                          Write-Host "Playit authentication completed."
-                      }
-                      else {
-                          Write-Host $line
-                      }
+              foreach ($line in $result) {
+
+                  $text = $line.ToString()
+
+                  if ($text -match "secret|key|token") {
+                      Write-Host "Playit authentication response received."
                   }
+                  else {
+                      Write-Host $text
+                  }
+              }
           }
 
           if ($exitCode -ne 0) {
-              throw "Playit Claim failed or timed out after exactly 120 seconds."
+              throw "Playit Claim was not completed within 120 seconds."
           }
 
-          $secret = $exchangeOutput |
-              ForEach-Object { $_.ToString().Trim() } |
-              Where-Object {
-                  $_ -match "^[A-Za-z0-9+/=_-]{20,}$"
+          $possibleSecret = @(
+              $result |
+              ForEach-Object {
+                  $_.ToString().Trim()
               } |
-              Select-Object -Last 1
+              Where-Object {
+                  $_.Length -ge 20 -and
+                  $_ -notmatch "\s"
+              }
+          )
+
+          if ($possibleSecret.Count -gt 0) {
+              $secret = $possibleSecret[-1]
+          }
 
           if ([string]::IsNullOrWhiteSpace($secret)) {
-              throw "Playit Claim completed but no secret key was returned."
+              throw "Playit claim completed but no secret key was returned."
           }
+
+          $secretPath = Join-Path `
+              $env:RUNNER_TEMP `
+              "playit-secret.txt"
 
           $secret |
               Out-File `
-                  -FilePath $secretFile `
+                  -FilePath $secretPath `
                   -Encoding utf8 `
                   -NoNewline
 
-          $acl = Get-Acl $secretFile
-
-          $acl.SetAccessRuleProtection($true,$false)
-
-          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-
-          $rule = New-Object `
-              System.Security.AccessControl.FileSystemAccessRule(
-                  $identity.Name,
-                  "FullControl",
-                  "Allow"
-              )
-
-          $acl.AddAccessRule($rule)
-
-          Set-Acl `
-              -Path $secretFile `
-              -AclObject $acl
-
-          "PLAYIT_SECRET_FILE=$secretFile" | Out-File `
+          "PLAYIT_SECRET_FILE=$secretPath" | Out-File `
               -FilePath $env:GITHUB_ENV `
               -Encoding utf8 `
               -Append
@@ -662,86 +748,43 @@ jobs:
 
           Status:
 
-          ✅ **Claim completed successfully**
+          ✅ **Claim completed**
 
-          Claim timeout:
+          Timeout:
 
           120 seconds
 
-          The Playit authentication secret was stored locally and was **not printed**.
+          The Playit secret was not printed.
 
           "@
 
-      # ==========================================================
-      # 12. START PLAYIT SERVICE
-      # ==========================================================
+      # ============================================================
+      # 12. START CLAIMED PLAYIT SERVICE
+      # ============================================================
 
-      - name: Start Playit service
+      - name: Start claimed Playit service
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $services = Get-Service -ErrorAction SilentlyContinue |
-              Where-Object {
-                  $_.Name -match "playit" -or
-                  $_.DisplayName -match "playit"
-              }
+          Write-Host "Starting claimed Playit service..."
 
-          if ($services) {
+          & $env:PLAYIT_EXE start
 
-              foreach ($service in $services) {
-
-                  Write-Host "Starting Playit service: $($service.Name)"
-
-                  Set-Service `
-                      -Name $service.Name `
-                      -StartupType Automatic `
-                      -ErrorAction SilentlyContinue
-
-                  Start-Service `
-                      -Name $service.Name `
-                      -ErrorAction SilentlyContinue
-              }
-
-          }
-          else {
-
-              Write-Host "No Playit service found."
-
-              if (Test-Path $env:PLAYIT_SECRET_FILE) {
-
-                  $playitSecret = Get-Content `
-                      $env:PLAYIT_SECRET_FILE `
-                      -Raw
-
-                  if ([string]::IsNullOrWhiteSpace($playitSecret)) {
-                      throw "Playit secret file is empty."
-                  }
-
-                  $playitProcess = Start-Process `
-                      -FilePath $env:PLAYIT_EXE `
-                      -ArgumentList @("--stdout") `
-                      -PassThru `
-                      -WindowStyle Hidden
-
-                  $playitProcess.Id | Out-File `
-                      -FilePath "$env:RUNNER_TEMP\playit-agent.pid" `
-                      -Encoding ascii
-
-              }
+          if ($LASTEXITCODE -ne 0) {
+              throw "Playit service could not be started."
           }
 
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 8
+
+          Write-Host ""
+          Write-Host "Playit status:"
 
           & $env:PLAYIT_EXE status
 
-          if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Playit status returned a non-zero code."
-          }
-
-      # ==========================================================
-      # 13. RDP CONFIGURATION
-      # ==========================================================
+      # ============================================================
+      # 13. RDP
+      # ============================================================
 
       - name: Configure RDP
         shell: pwsh
@@ -750,7 +793,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $securePassword = ConvertTo-SecureString `
+          $secure = ConvertTo-SecureString `
               $env:RDP_PASSWORD `
               -AsPlainText `
               -Force
@@ -763,14 +806,14 @@ jobs:
 
               Set-LocalUser `
                   -Name $env:RDP_USER `
-                  -Password $securePassword
+                  -Password $secure
 
           }
           else {
 
               New-LocalUser `
                   -Name $env:RDP_USER `
-                  -Password $securePassword `
+                  -Password $secure `
                   -PasswordNeverExpires `
                   -UserMayNotChangePassword `
                   -AccountNeverExpires
@@ -799,11 +842,8 @@ jobs:
               -Name "TermService" `
               -ErrorAction SilentlyContinue
 
-          Get-NetFirewallRule `
-              -DisplayGroup "Remote Desktop" `
-              -ErrorAction SilentlyContinue |
-              Disable-NetFirewallRule `
-              -ErrorAction SilentlyContinue
+          # Do NOT expose RDP to the Internet directly.
+          # Only localhost is allowed.
 
           Remove-NetFirewallRule `
               -DisplayName "GitHub Runner Local RDP" `
@@ -829,11 +869,11 @@ jobs:
               throw "RDP is not listening on TCP 3389."
           }
 
-          Write-Host "RDP is ready on localhost:3389."
+          Write-Host "RDP is listening on localhost:3389."
 
-      # ==========================================================
-      # 14. INSTALL TIGHTVNC
-      # ==========================================================
+      # ============================================================
+      # 14. VNC
+      # ============================================================
 
       - name: Install TightVNC
         shell: pwsh
@@ -844,17 +884,19 @@ jobs:
 
           $installer = Join-Path `
               $env:RUNNER_TEMP `
-              "tightvnc-x64.msi"
+              "tightvnc.msi"
 
           Invoke-WebRequest `
               -Uri $url `
-              -OutFile $installer
+              -OutFile $installer `
+              -UseBasicParsing `
+              -TimeoutSec 180
 
           if (-not (Test-Path $installer)) {
               throw "TightVNC installer was not downloaded."
           }
 
-          $process = Start-Process `
+          $p = Start-Process `
               -FilePath "msiexec.exe" `
               -ArgumentList @(
                   "/i",
@@ -866,8 +908,8 @@ jobs:
               -PassThru `
               -WindowStyle Hidden
 
-          if ($process.ExitCode -notin @(0,3010)) {
-              throw "TightVNC installation failed. Exit code: $($process.ExitCode)"
+          if ($p.ExitCode -notin @(0,3010)) {
+              throw "TightVNC installation failed."
           }
 
           Start-Sleep -Seconds 5
@@ -881,7 +923,7 @@ jobs:
               Select-Object -First 1 -ExpandProperty FullName
 
           if (-not $tvn) {
-              throw "tvnserver.exe was not found after installation."
+              throw "tvnserver.exe was not found."
           }
 
           "TVN_EXE=$tvn" | Out-File `
@@ -889,18 +931,13 @@ jobs:
               -Encoding utf8 `
               -Append
 
-      # ==========================================================
-      # 15. START / VERIFY VNC
-      # ==========================================================
-
       - name: Start and verify VNC
         shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $services = Get-Service -ErrorAction SilentlyContinue |
+          $services = Get-Service `
+              -ErrorAction SilentlyContinue |
               Where-Object {
                   $_.Name -match "tvn" -or
                   $_.DisplayName -match "TightVNC"
@@ -933,42 +970,42 @@ jobs:
               throw "VNC Server is not listening on TCP 5900."
           }
 
-          Write-Host "VNC is listening on TCP 5900."
+          Write-Host "VNC is ready."
 
-      # ==========================================================
-      # 16. INSTALL NOVNC
-      # ==========================================================
+      # ============================================================
+      # 15. NOVNC
+      # ============================================================
 
       - name: Install noVNC
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $noVncDir = "C:\noVNC"
+          if (Test-Path $env:NOVNC_DIR) {
 
-          if (Test-Path $noVncDir) {
               Remove-Item `
-                  -Path $noVncDir `
+                  $env:NOVNC_DIR `
                   -Recurse `
                   -Force
           }
 
           git clone `
               --depth 1 `
-              --branch $env:NOVNC_VERSION `
               https://github.com/novnc/noVNC.git `
-              $noVncDir
+              $env:NOVNC_DIR
 
-          if (-not (Test-Path "$noVncDir\vnc.html")) {
+          if (-not (Test-Path "$env:NOVNC_DIR\vnc.html")) {
               throw "noVNC installation failed."
           }
 
           py -3 -m pip install `
               --disable-pip-version-check `
               --no-warn-script-location `
-              "websockify==$env:WEBSOCKIFY_VERSION"
+              websockify
 
-          $python = (py -3 -c "import sys; print(sys.executable)").Trim()
+          $python = (
+              py -3 -c "import sys; print(sys.executable)"
+          ).Trim()
 
           if (-not (Test-Path $python)) {
               throw "Python executable was not found."
@@ -978,15 +1015,6 @@ jobs:
               -FilePath $env:GITHUB_ENV `
               -Encoding utf8 `
               -Append
-
-          "NOVNC_DIR=$noVncDir" | Out-File `
-              -FilePath $env:GITHUB_ENV `
-              -Encoding utf8 `
-              -Append
-
-      # ==========================================================
-      # 17. START NOVNC
-      # ==========================================================
 
       - name: Start noVNC
         shell: pwsh
@@ -1002,20 +1030,20 @@ jobs:
               "127.0.0.1:5900"
           )
 
-          $process = Start-Process `
+          $p = Start-Process `
               -FilePath $env:PYTHON_EXE `
               -ArgumentList $arguments `
               -PassThru `
               -WindowStyle Hidden
 
-          $process.Id | Out-File `
-              -FilePath "$env:RUNNER_TEMP\novnc.pid" `
+          $p.Id | Out-File `
+              "$env:RUNNER_TEMP\novnc.pid" `
               -Encoding ascii
 
           Start-Sleep -Seconds 5
 
-          if ($process.HasExited) {
-              throw "noVNC/websockify exited unexpectedly."
+          if ($p.HasExited) {
+              throw "noVNC/websockify exited."
           }
 
           $listener = Get-NetTCPConnection `
@@ -1027,14 +1055,15 @@ jobs:
               throw "noVNC is not listening on TCP 6080."
           }
 
-          Write-Host "noVNC is listening on localhost:6080."
+          Write-Host "noVNC is ready on 127.0.0.1:6080."
 
-      # ==========================================================
-      # 18. INSTALL ANYDESK
-      # ==========================================================
+      # ============================================================
+      # 16. ANYDESK
+      # ============================================================
 
       - name: Install AnyDesk
         shell: pwsh
+        continue-on-error: true
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -1042,86 +1071,85 @@ jobs:
               $env:RUNNER_TEMP `
               "AnyDesk.exe"
 
-          Invoke-WebRequest `
-              -Uri $env:ANYDESK_URL `
-              -OutFile $installer
+          try {
 
-          if (-not (Test-Path $installer)) {
-              throw "AnyDesk download failed."
+              Invoke-WebRequest `
+                  -Uri "https://download.anydesk.com/AnyDesk.exe" `
+                  -OutFile $installer `
+                  -UseBasicParsing `
+                  -TimeoutSec 180
+
+              if (-not (Test-Path $installer)) {
+                  throw "AnyDesk download failed."
+              }
+
+              $p = Start-Process `
+                  -FilePath $installer `
+                  -ArgumentList @(
+                      "--install",
+                      $env:ANYDESK_DIR,
+                      "--start-with-win",
+                      "--silent"
+                  ) `
+                  -Wait `
+                  -PassThru `
+                  -WindowStyle Hidden
+
+              if ($p.ExitCode -ne 0) {
+                  throw "AnyDesk installation returned $($p.ExitCode)."
+              }
+
+              Start-Sleep -Seconds 5
+
+              $anydesk = "$env:ANYDESK_DIR\AnyDesk.exe"
+
+              if (-not (Test-Path $anydesk)) {
+                  throw "AnyDesk.exe was not found."
+              }
+
+              "ANYDESK_EXE=$anydesk" | Out-File `
+                  -FilePath $env:GITHUB_ENV `
+                  -Encoding utf8 `
+                  -Append
+
+              Write-Host "AnyDesk installed."
+
+          }
+          catch {
+
+              Write-Warning "AnyDesk setup failed: $($_.Exception.Message)"
+              Write-Warning "Continuing without failing the workflow."
           }
 
-          $installDir = "C:\Program Files (x86)\AnyDesk"
-
-          $process = Start-Process `
-              -FilePath $installer `
-              -ArgumentList @(
-                  "--install",
-                  "`"$installDir`"",
-                  "--start-with-win",
-                  "--silent"
-              ) `
-              -Wait `
-              -PassThru `
-              -WindowStyle Hidden
-
-          if ($process.ExitCode -ne 0) {
-              throw "AnyDesk installation failed. Exit code: $($process.ExitCode)"
-          }
-
-          Start-Sleep -Seconds 5
-
-          $anydesk = @(
-              "$installDir\AnyDesk.exe",
-              "$env:ProgramFiles\AnyDesk\AnyDesk.exe"
-          ) |
-              Where-Object {
-                  Test-Path $_
-              } |
-              Select-Object -First 1
-
-          if (-not $anydesk) {
-              $anydesk = Get-ChildItem `
-                  -Path "$env:ProgramFiles","${env:ProgramFiles(x86)}" `
-                  -Filter "AnyDesk.exe" `
-                  -File `
-                  -Recurse `
-                  -ErrorAction SilentlyContinue |
-                  Select-Object -First 1 -ExpandProperty FullName
-          }
-
-          if (-not $anydesk) {
-              throw "AnyDesk.exe was not found."
-          }
-
-          "ANYDESK_EXE=$anydesk" | Out-File `
-              -FilePath $env:GITHUB_ENV `
-              -Encoding utf8 `
-              -Append
-
-      # ==========================================================
-      # 19. ANYDESK PASSWORD
-      # ==========================================================
+      # ============================================================
+      # 17. ANYDESK PASSWORD
+      # ============================================================
 
       - name: Configure AnyDesk unattended access
         shell: pwsh
+        continue-on-error: true
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        continue-on-error: true
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not (Test-Path $env:ANYDESK_EXE)) {
+          if (-not $env:ANYDESK_EXE) {
               Write-Warning "AnyDesk executable unavailable."
               exit 0
           }
 
-          $password = $env:RDP_PASSWORD
+          if (-not (Test-Path $env:ANYDESK_EXE)) {
+              Write-Warning "AnyDesk executable not found."
+              exit 0
+          }
 
-          $password |
-              & $env:ANYDESK_EXE --set-password _default
+          $env:RDP_PASSWORD |
+              & $env:ANYDESK_EXE `
+              --set-password `
+              _default
 
           if ($LASTEXITCODE -ne 0) {
-              Write-Warning "AnyDesk unattended-access password configuration failed."
+              Write-Warning "Could not configure AnyDesk unattended access."
               exit 0
           }
 
@@ -1132,30 +1160,42 @@ jobs:
           $id = & $env:ANYDESK_EXE --get-id 2>$null
 
           if ($id) {
-              "ANYDESK_ID=$($id | Select-Object -Last 1)" | Out-File `
+
+              $cleanId = (
+                  $id |
+                  Select-Object -Last 1
+              ).ToString().Trim()
+
+              "ANYDESK_ID=$cleanId" | Out-File `
                   -FilePath $env:GITHUB_ENV `
                   -Encoding utf8 `
                   -Append
           }
 
-      # ==========================================================
-      # 20. FILEZILLA
-      # ==========================================================
+      # ============================================================
+      # 18. FILEZILLA
+      # ============================================================
 
       - name: Install FileZilla
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $choco = Get-Command choco.exe -ErrorAction SilentlyContinue
+          $choco = Get-Command choco.exe `
+              -ErrorAction SilentlyContinue
 
           if ($choco) {
 
-              $package = choco search filezilla --exact --limit-output 2>$null
+              $result = choco search filezilla `
+                  --exact `
+                  --limit-output `
+                  2>$null
 
-              if ($package -match "(?m)^filezilla\|") {
+              if ($result -match "(?m)^filezilla\|") {
 
-                  choco install filezilla -y --no-progress
+                  choco install filezilla `
+                      -y `
+                      --no-progress
 
                   if ($LASTEXITCODE -ne 0) {
                       throw "Chocolatey FileZilla installation failed."
@@ -1164,48 +1204,16 @@ jobs:
               }
               else {
 
-                  Write-Host "Chocolatey FileZilla package not available."
-                  Write-Host "Trying official FileZilla installer."
-
-                  $page = Invoke-WebRequest `
-                      -Uri "https://filezilla-project.org/download.php?platform=win64" `
-                      -UseBasicParsing
-
-                  $match = [regex]::Match(
-                      $page.Content,
-                      'https://download\.filezilla-project\.org/client/[^"'']+win64-setup\.exe'
-                  )
-
-                  if (-not $match.Success) {
-                      throw "Current official FileZilla installer could not be located."
-                  }
-
-                  $installer = Join-Path `
-                      $env:RUNNER_TEMP `
-                      "filezilla.exe"
-
-                  Invoke-WebRequest `
-                      -Uri $match.Value `
-                      -OutFile $installer
-
-                  $process = Start-Process `
-                      -FilePath $installer `
-                      -ArgumentList "/S" `
-                      -Wait `
-                      -PassThru `
-                      -WindowStyle Hidden
-
-                  if ($process.ExitCode -ne 0) {
-                      throw "FileZilla official installer failed."
-                  }
+                  throw "Chocolatey FileZilla package is unavailable."
               }
 
           }
           else {
-              throw "Chocolatey was not available."
+
+              throw "Chocolatey is unavailable on this runner."
           }
 
-          $filezilla = @(
+          $exe = @(
               "$env:ProgramFiles\FileZilla FTP Client\filezilla.exe",
               "$env:ProgramFiles(x86)\FileZilla FTP Client\filezilla.exe"
           ) |
@@ -1214,8 +1222,9 @@ jobs:
               } |
               Select-Object -First 1
 
-          if (-not $filezilla) {
-              $filezilla = Get-ChildItem `
+          if (-not $exe) {
+
+              $exe = Get-ChildItem `
                   -Path "$env:ProgramFiles","${env:ProgramFiles(x86)}" `
                   -Filter "filezilla.exe" `
                   -File `
@@ -1224,52 +1233,52 @@ jobs:
                   Select-Object -First 1 -ExpandProperty FullName
           }
 
-          if (-not $filezilla) {
+          if (-not $exe) {
               throw "filezilla.exe was not found."
           }
 
-          "FILEZILLA_EXE=$filezilla" | Out-File `
+          "FILEZILLA_EXE=$exe" | Out-File `
               -FilePath $env:GITHUB_ENV `
               -Encoding utf8 `
               -Append
 
-      # ==========================================================
-      # 21. NOTEPAD++
-      # ==========================================================
+      # ============================================================
+      # 19. NOTEPAD++
+      # ============================================================
 
       - name: Install Notepad++ x64
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $choco = Get-Command choco.exe -ErrorAction SilentlyContinue
+          $choco = Get-Command choco.exe `
+              -ErrorAction SilentlyContinue
 
           if (-not $choco) {
-              throw "Chocolatey is not available."
+              throw "Chocolatey is unavailable."
           }
 
-          $package = choco search notepadplusplus.install --exact --limit-output 2>$null
+          $result = choco search notepadplusplus.install `
+              --exact `
+              --limit-output `
+              2>$null
 
-          if ($package -notmatch "(?m)^notepadplusplus\.install\|") {
-              throw "Current Notepad++ x64 package was not found."
+          if ($result -notmatch "(?m)^notepadplusplus\.install\|") {
+              throw "Notepad++ package was not found."
           }
 
-          choco install notepadplusplus.install -y --no-progress
+          choco install notepadplusplus.install `
+              -y `
+              --no-progress
 
           if ($LASTEXITCODE -ne 0) {
               throw "Notepad++ installation failed."
           }
 
-          $npp = @(
-              "$env:ProgramFiles\Notepad++\notepad++.exe",
-              "$env:ProgramFiles(x86)\Notepad++\notepad++.exe"
-          ) |
-              Where-Object {
-                  Test-Path $_
-              } |
-              Select-Object -First 1
+          $npp = "$env:ProgramFiles\Notepad++\notepad++.exe"
 
-          if (-not $npp) {
+          if (-not (Test-Path $npp)) {
+
               $npp = Get-ChildItem `
                   -Path "$env:ProgramFiles","${env:ProgramFiles(x86)}" `
                   -Filter "notepad++.exe" `
@@ -1288,16 +1297,16 @@ jobs:
               -Encoding utf8 `
               -Append
 
-      # ==========================================================
-      # 22. VERIFY EVERYTHING
-      # ==========================================================
+      # ============================================================
+      # 20. VERIFY EVERYTHING
+      # ============================================================
 
       - name: Verify services
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          function Test-ListeningPort {
+          function Test-Port {
               param(
                   [int]$Port,
                   [string]$Name
@@ -1312,20 +1321,12 @@ jobs:
                   throw "$Name is not listening on TCP $Port."
               }
 
-              Write-Host "OK: $Name -> TCP $Port"
+              Write-Host "OK: $Name -> $Port"
           }
 
-          Test-ListeningPort `
-              -Port 3389 `
-              -Name "RDP"
-
-          Test-ListeningPort `
-              -Port 5900 `
-              -Name "VNC"
-
-          Test-ListeningPort `
-              -Port 6080 `
-              -Name "noVNC"
+          Test-Port 3389 "RDP"
+          Test-Port 5900 "VNC"
+          Test-Port 6080 "noVNC"
 
           if (-not (Test-Path $env:FILEZILLA_EXE)) {
               throw "FileZilla verification failed."
@@ -1335,20 +1336,11 @@ jobs:
               throw "Notepad++ verification failed."
           }
 
-          if (-not (Test-Path $env:ANYDESK_EXE)) {
-              Write-Warning "AnyDesk verification failed."
-          }
+          Write-Host "All required services verified."
 
-          & $env:PLAYIT_EXE status 2>&1 |
-              ForEach-Object {
-                  Write-Host $_
-              }
-
-          Write-Host "All critical local services verified."
-
-      # ==========================================================
-      # 23. DESKTOP SCREENSHOT
-      # ==========================================================
+      # ============================================================
+      # 21. DESKTOP SCREENSHOT
+      # ============================================================
 
       - name: Capture Desktop screenshot
         shell: pwsh
@@ -1358,7 +1350,7 @@ jobs:
           Add-Type -AssemblyName System.Drawing
           Add-Type -AssemblyName System.Windows.Forms
 
-          $screenshot = Join-Path `
+          $output = Join-Path `
               $env:GITHUB_WORKSPACE `
               "desktop.png"
 
@@ -1368,22 +1360,43 @@ jobs:
               throw "No display detected."
           }
 
-          $left = ($screens | ForEach-Object { $_.Bounds.Left } | Measure-Object -Minimum).Minimum
-          $top = ($screens | ForEach-Object { $_.Bounds.Top } | Measure-Object -Minimum).Minimum
-          $right = ($screens | ForEach-Object { $_.Bounds.Right } | Measure-Object -Maximum).Maximum
-          $bottom = ($screens | ForEach-Object { $_.Bounds.Bottom } | Measure-Object -Maximum).Maximum
+          $left = (
+              $screens |
+              ForEach-Object { $_.Bounds.Left } |
+              Measure-Object -Minimum
+          ).Minimum
+
+          $top = (
+              $screens |
+              ForEach-Object { $_.Bounds.Top } |
+              Measure-Object -Minimum
+          ).Minimum
+
+          $right = (
+              $screens |
+              ForEach-Object { $_.Bounds.Right } |
+              Measure-Object -Maximum
+          ).Maximum
+
+          $bottom = (
+              $screens |
+              ForEach-Object { $_.Bounds.Bottom } |
+              Measure-Object -Maximum
+          ).Maximum
 
           $width = [int]($right - $left)
           $height = [int]($bottom - $top)
 
           if ($width -le 0 -or $height -le 0) {
-              throw "Invalid display dimensions."
+              throw "Invalid screen dimensions."
           }
 
-          $bitmap = New-Object System.Drawing.Bitmap `
-              $width,
-              $height,
-              ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+          $bitmap = New-Object `
+              System.Drawing.Bitmap(
+                  $width,
+                  $height,
+                  [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+              )
 
           $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 
@@ -1399,24 +1412,24 @@ jobs:
               )
 
               $bitmap.Save(
-                  $screenshot,
+                  $output,
                   [System.Drawing.Imaging.ImageFormat]::Png
               )
 
           }
           finally {
+
               $graphics.Dispose()
               $bitmap.Dispose()
+
           }
 
-          if (-not (Test-Path $screenshot)) {
+          if (-not (Test-Path $output)) {
               throw "desktop.png was not created."
           }
 
-          $size = (Get-Item $screenshot).Length
-
-          if ($size -lt 1024) {
-              throw "desktop.png is invalid."
+          if ((Get-Item $output).Length -lt 1024) {
+              throw "desktop.png appears invalid."
           }
 
           Add-Content `
@@ -1425,9 +1438,11 @@ jobs:
 
           ## 🖥️ Desktop Screenshot
 
-          Desktop screenshot captured successfully.
+          Screenshot captured successfully.
 
-          Download it from the **Windows Desktop Screenshot** artifact.
+          Artifact:
+
+          **Windows-Desktop-Screenshot**
 
           "@
 
@@ -1439,11 +1454,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # ==========================================================
-      # 24. CONNECTION SUMMARY
-      # ==========================================================
+      # ============================================================
+      # 22. FINAL SUMMARY
+      # ============================================================
 
-      - name: Build final Summary
+      - name: Create final Summary
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1453,19 +1468,17 @@ jobs:
           $cpu = Get-CimInstance Win32_Processor |
               Select-Object -First 1
 
-          $ramGB = [math]::Round(
+          $ram = [math]::Round(
               $cs.TotalPhysicalMemory / 1GB,
               2
           )
 
-          $anydeskId = if ($env:ANYDESK_ID) {
+          $anydesk = if ($env:ANYDESK_ID) {
               $env:ANYDESK_ID
           }
           else {
               "Unavailable"
           }
-
-          $playitStatus = "Claimed"
 
           Add-Content `
               -Path $env:GITHUB_STEP_SUMMARY `
@@ -1475,43 +1488,53 @@ jobs:
 
           ## System
 
-          OS:
+          **OS**
 
           $($os.Caption)
 
-          CPU:
+          **CPU**
 
           $($cpu.Name)
 
-          RAM:
+          **RAM**
 
-          $ramGB GB
+          $ram GB
 
           ## Applications
 
           - ✅ Playit $env:PLAYIT_VERSION
-          - ✅ TightVNC
+          - ✅ VNC
           - ✅ noVNC
+          - ✅ RDP
           - ✅ FileZilla
           - ✅ Notepad++
-          - ✅ AnyDesk
-          - ✅ RDP
+          - ⚠️ AnyDesk: $anydesk
 
-          ## Playit
+          ## 🎮 Playit
 
-          Status:
-
-          ✅ $playitStatus
-
-          Claim:
+          **Claim**
 
           ✅ Completed
 
-          ## Desktop Screenshot
+          **Claim URL**
 
-          [Windows Desktop Screenshot Artifact](../../actions/runs/$env:GITHUB_RUN_ID)
+          $env:PLAYIT_CLAIM_URL
 
-          ## Connection
+          **Tunnel**
+
+          Configure a Playit TCP tunnel in your Playit account with:
+
+          `6080 → 127.0.0.1:6080`
+
+          The public hostname/address assigned by Playit is not fabricated by this workflow.
+
+          ## 🖥️ Desktop Screenshot
+
+          Artifact:
+
+          **Windows-Desktop-Screenshot**
+
+          ## 🔌 Local Services
 
           ### RDP
 
@@ -1527,191 +1550,181 @@ jobs:
 
           `********`
 
+          ### VNC
+
+          Address:
+
+          `127.0.0.1:5900`
+
           ### noVNC
 
-          Local:
+          Address:
 
           `127.0.0.1:6080`
-
-          Playit:
-
-          The public Playit tunnel address depends on the tunnel assigned to this claimed agent.
 
           ### AnyDesk
 
           ID:
 
-          `$anydeskId`
+          `$anydesk`
 
           Password:
 
           `********`
 
-          ## Security
+          ## 🔐 Security
 
-          - RDP is not opened broadly through Windows Firewall.
-          - VNC is kept on localhost.
-          - noVNC connects to localhost VNC.
-          - Passwords are never written to Summary.
-          - No Tailscale is used.
+          - RDP is not exposed directly through the Windows Firewall.
+          - VNC listens locally.
+          - noVNC listens locally.
+          - RDP password is never printed.
+          - AnyDesk password is never printed.
+          - Playit secret is never printed.
           - No GitHub PAT is used.
-          - No `--secret_path` is used.
+          - No Tailscale is used.
+          - No `--secret_path` argument is used.
+          - No hostname is supplied twice.
 
           "@
 
-      # ==========================================================
-      # 25. KEEP SERVER ALIVE FOR 5 HOURS
-      # ==========================================================
+      # ============================================================
+      # 23. KEEP ALIVE
+      # ============================================================
 
       - name: Keep server alive
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
 
-          $runtimeSeconds = [int]$env:RUNTIME_MINUTES * 60
+          $totalSeconds = `
+              [int]$env:RUNTIME_MINUTES * 60
 
-          $startTime = Get-Date
-          $endTime = $startTime.AddSeconds($runtimeSeconds)
+          $start = Get-Date
+          $end = $start.AddSeconds($totalSeconds)
 
-          Write-Host "Server runtime:"
-          Write-Host "$($env:RUNTIME_MINUTES) minutes"
+          Write-Host ""
+          Write-Host "Server will remain active for $env:RUNTIME_MINUTES minutes."
+          Write-Host ""
 
-          function Restart-NoVNC {
+          while ((Get-Date) -lt $end) {
 
-              Write-Host "Restarting noVNC..."
-
-              Get-Process `
-                  python `
-                  -ErrorAction SilentlyContinue |
-                  Stop-Process `
-                  -Force `
-                  -ErrorAction SilentlyContinue
-
-              Start-Sleep -Seconds 2
-
-              $arguments = @(
-                  "-m",
-                  "websockify",
-                  "--web",
-                  $env:NOVNC_DIR,
-                  "6080",
-                  "127.0.0.1:5900"
-              )
-
-              Start-Process `
-                  -FilePath $env:PYTHON_EXE `
-                  -ArgumentList $arguments `
-                  -WindowStyle Hidden
-
-              Start-Sleep -Seconds 5
-          }
-
-          function Restart-Playit {
-
-              Write-Host "Restarting Playit..."
-
-              & $env:PLAYIT_EXE stop 2>$null
-
-              Start-Sleep -Seconds 2
-
-              & $env:PLAYIT_EXE start 2>$null
-
-              Start-Sleep -Seconds 5
-          }
-
-          while ((Get-Date) -lt $endTime) {
-
-              $remaining = $endTime - (Get-Date)
-
-              # --------------------------
+              # ----------------------------------------------------
               # RDP
-              # --------------------------
+              # ----------------------------------------------------
 
-              $rdpService = Get-Service `
+              $rdp = Get-Service `
                   -Name "TermService" `
                   -ErrorAction SilentlyContinue
 
-              if (-not $rdpService -or $rdpService.Status -ne "Running") {
+              if (-not $rdp -or $rdp.Status -ne "Running") {
 
-                  Write-Warning "RDP service is down."
+                  Write-Warning "RDP service stopped."
 
                   Start-Service `
                       -Name "TermService" `
                       -ErrorAction SilentlyContinue
               }
 
-              # --------------------------
+              # ----------------------------------------------------
               # VNC
-              # --------------------------
+              # ----------------------------------------------------
 
-              $vncListener = Get-NetTCPConnection `
+              $vnc = Get-NetTCPConnection `
                   -LocalPort 5900 `
                   -State Listen `
                   -ErrorAction SilentlyContinue
 
-              if (-not $vncListener) {
+              if (-not $vnc) {
 
-                  Write-Warning "VNC is not listening."
+                  Write-Warning "VNC stopped."
 
-                  $vncService = Get-Service `
+                  $services = Get-Service `
                       -ErrorAction SilentlyContinue |
                       Where-Object {
                           $_.Name -match "tvn" -or
                           $_.DisplayName -match "TightVNC"
-                      } |
-                      Select-Object -First 1
+                      }
 
-                  if ($vncService) {
+                  foreach ($service in $services) {
 
                       Start-Service `
-                          -Name $vncService.Name `
+                          -Name $service.Name `
                           -ErrorAction SilentlyContinue
                   }
               }
 
-              # --------------------------
+              # ----------------------------------------------------
               # noVNC
-              # --------------------------
+              # ----------------------------------------------------
 
-              $novncListener = Get-NetTCPConnection `
+              $web = Get-NetTCPConnection `
                   -LocalPort 6080 `
                   -State Listen `
                   -ErrorAction SilentlyContinue
 
-              if (-not $novncListener) {
-                  Restart-NoVNC
+              if (-not $web) {
+
+                  Write-Warning "noVNC stopped. Restarting..."
+
+                  Get-Process `
+                      python `
+                      -ErrorAction SilentlyContinue |
+                      Stop-Process `
+                      -Force `
+                      -ErrorAction SilentlyContinue
+
+                  Start-Sleep -Seconds 2
+
+                  $arguments = @(
+                      "-m",
+                      "websockify",
+                      "--web",
+                      $env:NOVNC_DIR,
+                      "6080",
+                      "127.0.0.1:5900"
+                  )
+
+                  Start-Process `
+                      -FilePath $env:PYTHON_EXE `
+                      -ArgumentList $arguments `
+                      -WindowStyle Hidden
               }
 
-              # --------------------------
+              # ----------------------------------------------------
               # Playit
-              # --------------------------
+              # ----------------------------------------------------
 
               try {
 
                   & $env:PLAYIT_EXE status 2>$null
 
                   if ($LASTEXITCODE -ne 0) {
-                      Restart-Playit
+
+                      Write-Warning "Playit status failed."
+
+                      & $env:PLAYIT_EXE start 2>$null
                   }
 
               }
               catch {
-                  Restart-Playit
+
+                  Write-Warning "Playit check failed."
+
+                  & $env:PLAYIT_EXE start 2>$null
               }
 
-              # --------------------------
+              # ----------------------------------------------------
               # AnyDesk
-              # --------------------------
+              # ----------------------------------------------------
 
-              if (Test-Path $env:ANYDESK_EXE) {
+              if ($env:ANYDESK_EXE -and
+                  (Test-Path $env:ANYDESK_EXE)) {
 
-                  $anydeskProcess = Get-Process `
+                  $process = Get-Process `
                       AnyDesk `
                       -ErrorAction SilentlyContinue
 
-                  if (-not $anydeskProcess) {
-
-                      Write-Warning "AnyDesk process is not running."
+                  if (-not $process) {
 
                       Start-Process `
                           -FilePath $env:ANYDESK_EXE `
@@ -1720,24 +1733,27 @@ jobs:
                   }
               }
 
-              $minutes = [math]::Floor(
-                  $remaining.TotalMinutes
+              $remaining = $end - (Get-Date)
+
+              $minutes = [math]::Max(
+                  0,
+                  [math]::Floor($remaining.TotalMinutes)
               )
 
               Write-Host ""
-              Write-Host "=========================================="
+              Write-Host "=============================================="
               Write-Host "Windows Server 2025"
-              Write-Host "Remaining runtime: $minutes minutes"
-              Write-Host "=========================================="
+              Write-Host "Remaining: $minutes minutes"
+              Write-Host "=============================================="
 
               Start-Sleep -Seconds 60
           }
 
-          Write-Host "Five-hour runtime completed."
+          Write-Host "Runtime completed."
 
-      # ==========================================================
-      # 26. GRACEFUL SHUTDOWN
-      # ==========================================================
+      # ============================================================
+      # 24. CLEAN SHUTDOWN
+      # ============================================================
 
       - name: Graceful shutdown
         if: always()
@@ -1756,20 +1772,22 @@ jobs:
 
           Write-Host "Stopping Playit..."
 
-          if ($env:PLAYIT_EXE -and (Test-Path $env:PLAYIT_EXE)) {
+          if ($env:PLAYIT_EXE -and
+              (Test-Path $env:PLAYIT_EXE)) {
+
               & $env:PLAYIT_EXE stop 2>$null
           }
 
-          Write-Host "Stopping TightVNC..."
+          Write-Host "Stopping VNC..."
 
-          $vncServices = Get-Service `
+          $services = Get-Service `
               -ErrorAction SilentlyContinue |
               Where-Object {
                   $_.Name -match "tvn" -or
                   $_.DisplayName -match "TightVNC"
               }
 
-          foreach ($service in $vncServices) {
+          foreach ($service in $services) {
 
               Stop-Service `
                   -Name $service.Name `
@@ -1779,7 +1797,9 @@ jobs:
 
           Write-Host "Stopping AnyDesk..."
 
-          if (Test-Path $env:ANYDESK_EXE) {
+          if ($env:ANYDESK_EXE -and
+              (Test-Path $env:ANYDESK_EXE)) {
+
               & $env:ANYDESK_EXE --stop-service 2>$null
           }
 
@@ -1795,4 +1815,4 @@ jobs:
               -Force `
               -ErrorAction SilentlyContinue
 
-          Write-Host "Graceful shutdown completed."
+          Write-Host "Cleanup completed."
