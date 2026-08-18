@@ -1,0 +1,482 @@
+name: Windows 2025 - Tailscale Remote Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-remote:
+    name: Windows Server 2025 Remote
+    runs-on: windows-2025
+
+    # GitHub maximum is 6 hours.
+    # We use 5 hours.
+    timeout-minutes: 300
+
+    steps:
+
+      # ============================================================
+      # SYSTEM INFORMATION
+      # ============================================================
+
+      - name: System Information
+        shell: powershell
+        run: |
+          Write-Host "=========================================="
+          Write-Host " Windows Server 2025"
+          Write-Host "=========================================="
+
+          Get-ComputerInfo |
+            Select-Object `
+              WindowsProductName,
+              WindowsVersion,
+              OsArchitecture
+
+      # ============================================================
+      # TAILSCALE
+      # ============================================================
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Verify Tailscale
+        shell: powershell
+        run: |
+          $tailscale = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $tailscale)) {
+            $tailscale = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+          }
+
+          if (!(Test-Path $tailscale)) {
+            throw "Tailscale executable was not found."
+          }
+
+          Write-Host "Tailscale status:"
+          & $tailscale status
+
+          $ip = & $tailscale ip -4
+
+          if (!$ip) {
+            throw "Could not obtain Tailscale IPv4."
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale connected successfully."
+
+      # ============================================================
+      # FILEZILLA
+      # ============================================================
+
+      - name: Install FileZilla
+        shell: powershell
+        run: |
+          Write-Host "Installing FileZilla..."
+
+          winget install `
+            --id FileZilla.Client `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
+
+          Write-Host "FileZilla installation completed."
+
+      # ============================================================
+      # NOTEPAD++
+      # ============================================================
+
+      - name: Install Notepad++
+        shell: powershell
+        run: |
+          Write-Host "Installing Notepad++..."
+
+          winget install `
+            --id Notepad++.Notepad++ `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
+
+          Write-Host "Notepad++ installation completed."
+
+      # ============================================================
+      # ENABLE RDP
+      # ============================================================
+
+      - name: Enable Remote Desktop
+        shell: powershell
+        run: |
+
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Set-Service `
+            -Name TermService `
+            -StartupType Automatic
+
+          Start-Service TermService
+
+          Write-Host "Remote Desktop enabled."
+
+      # ============================================================
+      # CREATE RDP USER
+      # ============================================================
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+
+          $username = "remoteuser"
+
+          $securePassword = ConvertTo-SecureString `
+            "${{ secrets.RDP_PASSWORD }}" `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if (!$existingUser) {
+
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -FullName "Remote User" `
+              -Description "Temporary GitHub Actions RDP user" `
+              -PasswordNeverExpires
+
+          } else {
+
+            Set-LocalUser `
+              -Name $username `
+              -Password $securePassword
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP user configured."
+
+      # ============================================================
+      # WAIT FOR DESKTOP
+      # ============================================================
+
+      - name: Wait for Desktop
+        shell: powershell
+        run: |
+
+          Write-Host "Waiting for Windows desktop..."
+
+          Start-Sleep -Seconds 15
+
+      # ============================================================
+      # SCREENSHOT
+      # ============================================================
+
+      - name: Capture Desktop Screenshot
+        shell: powershell
+        run: |
+
+          Write-Host "=========================================="
+          Write-Host " Capturing Desktop Screenshot"
+          Write-Host "=========================================="
+
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+
+          $screens = [System.Windows.Forms.Screen]::AllScreens
+
+          $left = (
+            $screens |
+            ForEach-Object { $_.Bounds.Left } |
+            Measure-Object -Minimum
+          ).Minimum
+
+          $top = (
+            $screens |
+            ForEach-Object { $_.Bounds.Top } |
+            Measure-Object -Minimum
+          ).Minimum
+
+          $right = (
+            $screens |
+            ForEach-Object { $_.Bounds.Right } |
+            Measure-Object -Maximum
+          ).Maximum
+
+          $bottom = (
+            $screens |
+            ForEach-Object { $_.Bounds.Bottom } |
+            Measure-Object -Maximum
+          ).Maximum
+
+          $width = $right - $left
+          $height = $bottom - $top
+
+          Write-Host "Screen area:"
+          Write-Host "Left:   $left"
+          Write-Host "Top:    $top"
+          Write-Host "Width:  $width"
+          Write-Host "Height: $height"
+
+          $bitmap = New-Object `
+            System.Drawing.Bitmap `
+            $width,
+            $height
+
+          $graphics = `
+            [System.Drawing.Graphics]::FromImage($bitmap)
+
+          $graphics.CopyFromScreen(
+            $left,
+            $top,
+            0,
+            0,
+            $bitmap.Size
+          )
+
+          $screenshot = `
+            Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "desktop-before-ip.png"
+
+          $bitmap.Save(
+            $screenshot,
+            [System.Drawing.Imaging.ImageFormat]::Png
+          )
+
+          $graphics.Dispose()
+          $bitmap.Dispose()
+
+          if (!(Test-Path $screenshot)) {
+            throw "Screenshot was not created."
+          }
+
+          $size = (Get-Item $screenshot).Length
+
+          Write-Host "Screenshot created successfully."
+          Write-Host "File: $screenshot"
+          Write-Host "Size: $size bytes"
+
+      # ============================================================
+      # UPLOAD SCREENSHOT
+      # ============================================================
+
+      - name: Upload Desktop Screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-2025-desktop-screenshot
+          path: desktop-before-ip.png
+          if-no-files-found: error
+          retention-days: 1
+
+      # ============================================================
+      # GITHUB ACTIONS SUMMARY
+      #
+      # IMPORTANT:
+      # Screenshot itself cannot be embedded directly from an
+      # Actions artifact URL, so we provide a direct Artifact link.
+      # ============================================================
+
+      - name: Create GitHub Actions Summary
+        shell: powershell
+        env:
+          TAILSCALE_IP: ${{ env.TAILSCALE_IP }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+
+          $summary = @"
+
+          # 🖥️ Windows Server 2025
+
+          ## ✅ Machine Status
+
+          | Component | Status |
+          |---|---|
+          | Windows | Windows Server 2025 |
+          | Tailscale | 🟢 Connected |
+          | FileZilla | 🟢 Installed |
+          | Notepad++ | 🟢 Installed |
+          | RDP | 🟢 Enabled |
+          | Runtime | ⏱️ 5 Hours |
+
+          ## 📸 Desktop Screenshot
+
+          The desktop screenshot was captured **before the Tailscale IP was displayed**.
+
+          **[📥 Open / Download Desktop Screenshot](../actions/runs/$env:RUN_ID)**
+
+          Screenshot artifact:
+
+          **windows-2025-desktop-screenshot**
+
+          ## 🔐 Remote Desktop
+
+          > The connection information is displayed below only after the screenshot was captured.
+
+          **Tailscale IP**
+
+          ``````
+          $env:TAILSCALE_IP
+          ``````
+
+          **RDP Address**
+
+          ``````
+          $env:TAILSCALE_IP`:3389
+          ``````
+
+          **Username**
+
+          ``````
+          remoteuser
+          ``````
+
+          **Password**
+
+          Use the value stored in the GitHub Actions secret:
+
+          ``````
+          RDP_PASSWORD
+          ``````
+
+          ## ⏱️ Runtime
+
+          The Windows runner will remain active for approximately **5 hours**.
+
+          ## ⚠️ Important
+
+          This is a temporary GitHub-hosted Windows runner.
+
+          When the GitHub Actions job finishes, the Windows machine is destroyed.
+
+          "@
+
+          $summary |
+            Out-File `
+              -FilePath $env:GITHUB_STEP_SUMMARY `
+              -Encoding utf8
+
+      # ============================================================
+      # SHOW IP
+      #
+      # THIS STEP IS AFTER SCREENSHOT + ARTIFACT UPLOAD.
+      # ============================================================
+
+      - name: Show Remote Connection Information
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "=================================================="
+          Write-Host "        WINDOWS SERVER 2025 REMOTE ACCESS"
+          Write-Host "=================================================="
+          Write-Host ""
+
+          Write-Host "Tailscale IP:"
+          Write-Host $env:TAILSCALE_IP
+
+          Write-Host ""
+
+          Write-Host "RDP:"
+          Write-Host "$($env:TAILSCALE_IP):3389"
+
+          Write-Host ""
+
+          Write-Host "Username:"
+          Write-Host "remoteuser"
+
+          Write-Host ""
+
+          Write-Host "Password:"
+          Write-Host "Stored in GitHub Secret: RDP_PASSWORD"
+
+          Write-Host ""
+
+          Write-Host "=================================================="
+
+      # ============================================================
+      # KEEP RUNNER ALIVE FOR 5 HOURS
+      # ============================================================
+
+      - name: Keep Windows Server Online
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "Windows Server 2025 is ONLINE."
+          Write-Host "Runtime: 5 hours."
+          Write-Host ""
+
+          $totalSeconds = 5 * 60 * 60
+
+          for ($i = 0; $i -lt $totalSeconds; $i++) {
+
+            if (($i % 60) -eq 0) {
+
+              $remaining = $totalSeconds - $i
+
+              $hours = [math]::Floor(
+                $remaining / 3600
+              )
+
+              $minutes = [math]::Floor(
+                ($remaining % 3600) / 60
+              )
+
+              Write-Host `
+                "Remaining: ${hours}h ${minutes}m"
+            }
+
+            Start-Sleep -Seconds 1
+          }
+
+          Write-Host ""
+          Write-Host "5-hour runtime completed."
+
+      # ============================================================
+      # CLEANUP
+      # ============================================================
+
+      - name: Cleanup
+        if: always()
+        shell: powershell
+        run: |
+
+          Write-Host "Cleaning up Tailscale..."
+
+          $tailscale = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+
+          if (Test-Path $tailscale) {
+
+            try {
+              & $tailscale logout
+            }
+            catch {
+              Write-Host "Tailscale logout completed."
+            }
+          }
+
+          Write-Host "Cleanup completed."
