@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-2025-playit-novnc
+  group: windows-2025-playit-remote
   cancel-in-progress: false
 
 defaults:
@@ -18,14 +18,17 @@ jobs:
 
   windows-remote:
 
-    name: Windows Server 2025 - Playit noVNC
+    name: Windows Server 2025 Remote
 
     runs-on: windows-2025
 
-    timeout-minutes: 300
+    # GitHub maximum allowed runtime for this job
+    timeout-minutes: 360
 
     env:
       RDP_USER: amiraliali3
+      PLAYIT_DIR: C:\playit
+      NOVNC_DIR: C:\noVNC
 
     steps:
 
@@ -40,7 +43,7 @@ jobs:
 
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "        WINDOWS SERVER 2025"
+          Write-Host "             WINDOWS SERVER 2025"
           Write-Host "=================================================="
 
           $os = Get-ComputerInfo
@@ -71,235 +74,385 @@ jobs:
           )
 
       # ============================================================
-      # CHOCOLATEY
+      # PLAYIT - INSTALL FIRST
       # ============================================================
 
-      - name: "📦 Verify Chocolatey"
+      - name: "🎮 Install Playit"
         run: |
 
           $ErrorActionPreference = "Stop"
 
-          $choco =
-            "C:\ProgramData\chocolatey\bin\choco.exe"
+          Write-Host ""
+          Write-Host "=================================================="
+          Write-Host "                 PLAYIT SETUP"
+          Write-Host "=================================================="
 
-          if (!(Test-Path $choco)) {
-            throw "Chocolatey is not available."
+          New-Item `
+            -ItemType Directory `
+            -Path $env:PLAYIT_DIR `
+            -Force |
+            Out-Null
+
+          # Official Playit Windows installation method.
+          # The official agent repository documents winget as
+          # an installation option for Windows.
+
+          $winget =
+            Get-Command winget `
+              -ErrorAction SilentlyContinue
+
+          if ($null -eq $winget) {
+
+            throw "Windows Package Manager (winget) was not found."
           }
 
-          Write-Host "Chocolatey version:"
-          & $choco --version
+          Write-Host "Installing official Playit agent..."
 
-      # ============================================================
-      # FILEZILLA
-      # ============================================================
-
-      - name: "📁 Install FileZilla"
-        run: |
-
-          $ErrorActionPreference = "Stop"
-
-          $choco =
-            "C:\ProgramData\chocolatey\bin\choco.exe"
-
-          Write-Host "Installing FileZilla..."
-
-          & $choco install filezilla `
-            --yes `
-            --no-progress
+          winget install `
+            --id DevelopedMethods.playit `
+            --exact `
+            --accept-source-agreements `
+            --accept-package-agreements `
+            --silent
 
           if ($LASTEXITCODE -ne 0) {
-            throw "FileZilla installation failed."
+
+            Write-Warning (
+              "winget returned exit code {0}. " +
+              "Trying to locate an existing Playit installation." -f
+              $LASTEXITCODE
+            )
           }
 
-          $paths = @(
-            "$env:ProgramFiles\FileZilla FTP Client\filezilla.exe",
-            "${env:ProgramFiles(x86)}\FileZilla FTP Client\filezilla.exe"
+          $candidates = @(
+            "$env:ProgramFiles\playit\playit.exe",
+            "$env:ProgramFiles\Playit\playit.exe",
+            "${env:ProgramFiles(x86)}\playit\playit.exe",
+            "${env:ProgramFiles(x86)}\Playit\playit.exe",
+            "$env:LOCALAPPDATA\Programs\playit\playit.exe"
           )
 
-          $found = $null
+          $playit = $null
 
-          foreach ($path in $paths) {
+          foreach ($candidate in $candidates) {
 
-            if (Test-Path $path) {
-              $found = $path
+            if (Test-Path $candidate) {
+
+              $playit = $candidate
               break
             }
           }
 
-          if ($null -eq $found) {
-            throw "FileZilla executable was not found."
+          if ($null -eq $playit) {
+
+            $playit =
+              Get-ChildItem `
+                "$env:ProgramFiles",
+                "${env:ProgramFiles(x86)}",
+                "$env:LOCALAPPDATA" `
+                -Filter "playit.exe" `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
           }
 
-          Write-Host "FileZilla installed:"
-          Write-Host $found
+          if ([string]::IsNullOrWhiteSpace($playit)) {
 
-          "FILEZILLA_PATH=$found" >> $env:GITHUB_ENV
-
-      # ============================================================
-      # NOTEPAD++
-      # ============================================================
-
-      - name: "📝 Install Notepad++"
-        run: |
-
-          $ErrorActionPreference = "Stop"
-
-          $choco =
-            "C:\ProgramData\chocolatey\bin\choco.exe"
-
-          Write-Host "Installing Notepad++..."
-
-          & $choco install notepadplusplus.install `
-            --yes `
-            --no-progress
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Notepad++ installation failed."
+            throw "Playit executable could not be found."
           }
 
-          $paths = @(
-            "$env:ProgramFiles\Notepad++\notepad++.exe",
-            "${env:ProgramFiles(x86)}\Notepad++\notepad++.exe"
-          )
+          Write-Host "Playit executable:"
+          Write-Host $playit
 
-          $found = $null
-
-          foreach ($path in $paths) {
-
-            if (Test-Path $path) {
-              $found = $path
-              break
-            }
-          }
-
-          if ($null -eq $found) {
-            throw "Notepad++ executable was not found."
-          }
-
-          Write-Host "Notepad++ installed:"
-          Write-Host $found
-
-          "NOTEPADPP_PATH=$found" >> $env:GITHUB_ENV
+          "PLAYIT_EXE=$playit" >> $env:GITHUB_ENV
 
       # ============================================================
-      # AVICA
-      #
-      # IMPORTANT:
-      # NO CHOCOLATEY INSTALLATION IS USED HERE.
+      # PLAYIT - START
       # ============================================================
 
-      - name: "🖥️ Avica Check"
+      - name: "🚀 Start Playit and Generate Claim"
         run: |
 
           $ErrorActionPreference = "Continue"
 
+          $playit = $env:PLAYIT_EXE
+
+          if (
+            [string]::IsNullOrWhiteSpace($playit) -or
+            !(Test-Path $playit)
+          ) {
+
+            throw "Playit executable is unavailable."
+          }
+
+          Write-Host ""
+          Write-Host "Starting Playit agent..."
+          Write-Host ""
+
+          $log =
+            "$env:RUNNER_TEMP\playit.log"
+
+          $err =
+            "$env:RUNNER_TEMP\playit-error.log"
+
+          # Start agent and keep its stdout/stderr.
+          $proc =
+            Start-Process `
+              -FilePath $playit `
+              -ArgumentList `
+                "--secret_path",
+                "$env:PLAYIT_DIR\agent-secret.txt" `
+              -RedirectStandardOutput $log `
+              -RedirectStandardError $err `
+              -PassThru `
+              -WindowStyle Hidden
+
+          "PLAYIT_PID=$($proc.Id)" >> $env:GITHUB_ENV
+
+          Write-Host "Playit PID:"
+          Write-Host $proc.Id
+
+          Start-Sleep -Seconds 5
+
+          if ($proc.HasExited) {
+
+            Write-Host "Playit exited."
+
+            if (Test-Path $log) {
+              Get-Content $log
+            }
+
+            if (Test-Path $err) {
+              Get-Content $err
+            }
+
+            throw "Playit agent exited before claiming."
+          }
+
+          Write-Host ""
+          Write-Host "Waiting for Playit claim information..."
+          Write-Host ""
+
+      # ============================================================
+      # PLAYIT - SHOW CLAIM URL
+      # ============================================================
+
+      - name: "🔗 Get Playit Claim URL"
+        run: |
+
+          $ErrorActionPreference = "Continue"
+
+          $log =
+            "$env:RUNNER_TEMP\playit.log"
+
+          $claim = $null
+
+          for (
+            $i = 0;
+            $i -lt 30;
+            $i++
+          ) {
+
+            if (Test-Path $log) {
+
+              $content =
+                Get-Content `
+                  $log `
+                  -Raw `
+                  -ErrorAction SilentlyContinue
+
+              if ($content) {
+
+                Write-Host $content
+
+                # Detect the normal playit claim URL.
+                $match =
+                  [regex]::Match(
+                    $content,
+                    'https://playit\.gg/claim/[A-Za-z0-9_-]+'
+                  )
+
+                if ($match.Success) {
+
+                  $claim =
+                    $match.Value
+
+                  break
+                }
+              }
+            }
+
+            Start-Sleep -Seconds 2
+          }
+
+          if ($null -eq $claim) {
+
+            Write-Host ""
+            Write-Host "Playit did not expose a claim URL in stdout yet."
+            Write-Host ""
+
+            if (Test-Path $log) {
+              Get-Content $log
+            }
+
+            throw `
+              "Playit claim URL was not detected. " +
+              "Check the Playit agent output above."
+          }
+
+          "PLAYIT_CLAIM_URL=$claim" >> $env:GITHUB_ENV
+
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "                 AVICA CHECK"
+          Write-Host "                 PLAYIT CLAIM"
           Write-Host "=================================================="
+          Write-Host ""
+          Write-Host $claim
+          Write-Host ""
 
-          $paths = @(
-            "$env:ProgramFiles\Avica\Avica.exe",
-            "${env:ProgramFiles(x86)}\Avica\Avica.exe",
-            "$env:LOCALAPPDATA\Programs\Avica\Avica.exe",
-            "$env:ProgramFiles\Avica\AvicaClient.exe",
-            "${env:ProgramFiles(x86)}\Avica\AvicaClient.exe"
-          )
+          @"
 
-          $found = $null
+          # 🎮 Playit Claim Required
 
-          foreach ($path in $paths) {
+          ## 🔗 Open this link
 
-            if (Test-Path $path) {
+          **$claim**
 
-              $found = $path
+          ### ⏸️ Workflow is waiting for you
 
-              break
+          1. Open the Claim URL above.
+          2. Sign in to Playit if required.
+          3. Claim/add this agent.
+          4. Return to this GitHub Actions run.
+          5. The workflow will automatically continue.
+
+          **Do not cancel the workflow.**
+
+          "@ |
+            Out-File `
+              $env:GITHUB_STEP_SUMMARY `
+              -Append `
+              -Encoding utf8
+
+      # ============================================================
+      # PLAYIT - WAIT FOR CLAIM
+      # ============================================================
+
+      - name: "⏸️ Wait Until Playit Is Claimed"
+        run: |
+
+          $ErrorActionPreference = "Continue"
+
+          $playit = $env:PLAYIT_EXE
+
+          Write-Host ""
+          Write-Host "=================================================="
+          Write-Host "           WAITING FOR PLAYIT CLAIM"
+          Write-Host "=================================================="
+          Write-Host ""
+
+          $claimed = $false
+
+          # Wait up to 30 minutes.
+          # This gives enough time to open the claim link manually.
+
+          for (
+            $minute = 1;
+            $minute -le 30;
+            $minute++
+          ) {
+
+            Write-Host (
+              "[{0}] Checking Playit status..." -f
+              (Get-Date -Format "HH:mm:ss")
+            )
+
+            Start-Sleep -Seconds 10
+
+            $log =
+              "$env:RUNNER_TEMP\playit.log"
+
+            if (Test-Path $log) {
+
+              $content =
+                Get-Content `
+                  $log `
+                  -Raw `
+                  -ErrorAction SilentlyContinue
+
+              # A claimed agent normally starts reporting
+              # connection/control/tunnel activity.
+
+              if (
+                $content -match
+                "connected|online|registered|agent"
+              ) {
+
+                Write-Host ""
+                Write-Host "Playit is reporting active agent state."
+
+                $claimed = $true
+                break
+              }
             }
+
+            # Check whether the Playit process is still alive.
+            $process =
+              Get-Process `
+                -Id $env:PLAYIT_PID `
+                -ErrorAction SilentlyContinue
+
+            if ($null -eq $process) {
+
+              Write-Host ""
+              Write-Host "Playit process stopped."
+
+              if (Test-Path $log) {
+                Get-Content $log
+              }
+
+              throw "Playit agent stopped before claim completed."
+            }
+
+            # Give GitHub visible progress.
+            Write-Host (
+              "Waiting... {0}/30 minutes" -f
+              $minute
+            )
           }
 
-          if ($null -ne $found) {
+          if (!$claimed) {
 
-            Write-Host "Avica found:"
-            Write-Host $found
+            Write-Host ""
+            Write-Host "Playit was not confirmed as claimed."
 
-            "AVICA_STATUS=installed" >> $env:GITHUB_ENV
-            "AVICA_PATH=$found" >> $env:GITHUB_ENV
-
+            throw `
+              "Claim timeout reached. " +
+              "Claim Playit and run the workflow again."
           }
-          else {
 
-            Write-Host "Avica is not currently installed."
-            Write-Host "Skipping Avica without failing the workflow."
+          Write-Host ""
+          Write-Host "Playit claim appears to be complete."
 
-            "AVICA_STATUS=not-installed" >> $env:GITHUB_ENV
-          }
+          @"
+
+          ## ✅ Playit Claimed
+
+          The Playit agent is now active.
+
+          Continuing with Windows remote-access setup...
+
+          "@ |
+            Out-File `
+              $env:GITHUB_STEP_SUMMARY `
+              -Append `
+              -Encoding utf8
 
       # ============================================================
       # RDP
       # ============================================================
 
-      - name: "🔐 Enable Remote Desktop"
-        run: |
-
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "Enabling RDP..."
-
-          Set-ItemProperty `
-            -Path `
-            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0 `
-            -Force
-
-          Set-ItemProperty `
-            -Path `
-            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" `
-            -Value 1 `
-            -Force
-
-          Set-ItemProperty `
-            -Path `
-            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "SecurityLayer" `
-            -Value 2 `
-            -Force
-
-          Enable-NetFirewallRule `
-            -DisplayGroup "Remote Desktop"
-
-          Set-Service `
-            -Name TermService `
-            -StartupType Automatic
-
-          if (
-            (Get-Service TermService).Status -ne "Running"
-          ) {
-
-            Start-Service TermService
-          }
-
-          Start-Sleep -Seconds 3
-
-          $listener =
-            Get-NetTCPConnection `
-              -LocalPort 3389 `
-              -State Listen `
-              -ErrorAction SilentlyContinue
-
-          if ($null -eq $listener) {
-            throw "RDP is not listening on TCP 3389."
-          }
-
-          Write-Host "RDP is ready."
-
-      # ============================================================
-      # CREATE RDP USER
-      # ============================================================
-
-      - name: "👤 Configure RDP Account"
+      - name: "🔐 Configure RDP"
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
@@ -317,56 +470,78 @@ jobs:
 
           Write-Output "::add-mask::$env:RDP_PASSWORD"
 
-          $username =
-            $env:RDP_USER
+          Write-Host "Enabling RDP..."
 
-          $securePassword =
+          Set-ItemProperty `
+            -Path `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1 `
+            -Force
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Set-Service `
+            -Name TermService `
+            -StartupType Automatic
+
+          if (
+            (Get-Service TermService).Status -ne "Running"
+          ) {
+
+            Start-Service TermService
+          }
+
+          $secure =
             ConvertTo-SecureString `
               $env:RDP_PASSWORD `
               -AsPlainText `
               -Force
 
-          $user =
+          $existing =
             Get-LocalUser `
-              -Name $username `
+              -Name $env:RDP_USER `
               -ErrorAction SilentlyContinue
 
-          if ($null -eq $user) {
+          if ($null -eq $existing) {
 
             New-LocalUser `
-              -Name $username `
-              -Password $securePassword `
+              -Name $env:RDP_USER `
+              -Password $secure `
               -FullName "amiraliali3" `
-              -Description "Temporary RDP account" `
+              -Description "Temporary RDP user" `
               -PasswordNeverExpires `
               -AccountNeverExpires |
               Out-Null
-
-            Write-Host "RDP user created."
 
           }
           else {
 
             Set-LocalUser `
-              -Name $username `
-              -Password $securePassword
-
-            Write-Host "RDP password updated."
+              -Name $env:RDP_USER `
+              -Password $secure
           }
 
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
-            -Member $username `
+            -Member $env:RDP_USER `
             -ErrorAction SilentlyContinue
 
-          Write-Host "RDP username:"
-          Write-Host $username
+          Write-Host "RDP configured."
 
       # ============================================================
-      # PYTHON
+      # FILEZILLA
       # ============================================================
 
-      - name: "🐍 Install Python"
+      - name: "📁 Install FileZilla"
         run: |
 
           $ErrorActionPreference = "Stop"
@@ -374,23 +549,276 @@ jobs:
           $choco =
             "C:\ProgramData\chocolatey\bin\choco.exe"
 
-          & $choco install python `
+          if (!(Test-Path $choco)) {
+            throw "Chocolatey is unavailable."
+          }
+
+          & $choco install filezilla `
             --yes `
             --no-progress
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Python installation failed."
+            throw "FileZilla installation failed."
           }
 
-          $python =
-            Get-Command python.exe `
+          Write-Host "FileZilla installed."
+
+      # ============================================================
+      # NOTEPAD++
+      # ============================================================
+
+      - name: "📝 Install Notepad++"
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          $choco =
+            "C:\ProgramData\chocolatey\bin\choco.exe"
+
+          & $choco install notepadplusplus.install `
+            --yes `
+            --no-progress
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Notepad++ installation failed."
+          }
+
+          Write-Host "Notepad++ installed."
+
+      # ============================================================
+      # ANYDESK
+      # ============================================================
+
+      - name: "🟢 Install AnyDesk"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          if (
+            [string]::IsNullOrWhiteSpace(
+              $env:RDP_PASSWORD
+            )
+          ) {
+
+            throw "RDP_PASSWORD secret is missing."
+          }
+
+          Write-Output "::add-mask::$env:RDP_PASSWORD"
+
+          $url =
+            "https://download.anydesk.com/AnyDesk.exe"
+
+          $installer =
+            "$env:TEMP\AnyDesk.exe"
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer
+
+          $installDir =
+            "C:\Program Files (x86)\AnyDesk"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $installDir `
+            -Force |
+            Out-Null
+
+          $p =
+            Start-Process `
+              -FilePath $installer `
+              -ArgumentList `
+                "--install",
+                "`"$installDir`"",
+                "--start-with-win",
+                "--silent" `
+              -Wait `
+              -PassThru
+
+          Remove-Item `
+            $installer `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          $anydesk =
+            "$installDir\AnyDesk.exe"
+
+          if (!(Test-Path $anydesk)) {
+
+            $anydesk =
+              Get-ChildItem `
+                "$env:ProgramFiles",
+                "${env:ProgramFiles(x86)}" `
+                -Filter "AnyDesk.exe" `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+
+          if (
+            [string]::IsNullOrWhiteSpace($anydesk)
+          ) {
+
+            throw "AnyDesk executable was not found."
+          }
+
+          "ANYDESK_PATH=$anydesk" >> $env:GITHUB_ENV
+
+          Start-Process `
+            -FilePath $anydesk `
+            -ArgumentList "--start" `
+            -WindowStyle Hidden `
+            -ErrorAction SilentlyContinue
+
+          Start-Sleep -Seconds 5
+
+          # Configure unattended password.
+          # Password is supplied through stdin and never printed.
+
+          $bytes =
+            [Text.Encoding]::UTF8.GetBytes(
+              $env:RDP_PASSWORD
+            )
+
+          $psi =
+            New-Object System.Diagnostics.ProcessStartInfo
+
+          $psi.FileName = $anydesk
+          $psi.Arguments = "--set-password"
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardInput = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.CreateNoWindow = $true
+
+          $proc =
+            New-Object System.Diagnostics.Process
+
+          $proc.StartInfo = $psi
+
+          $proc.Start() | Out-Null
+
+          $proc.StandardInput.WriteLine(
+            $env:RDP_PASSWORD
+          )
+
+          $proc.StandardInput.Close()
+
+          $proc.WaitForExit(15000) | Out-Null
+
+          if (!$proc.HasExited) {
+            $proc.Kill()
+          }
+
+          Write-Host "AnyDesk installed."
+
+      # ============================================================
+      # ANYDESK ID
+      # ============================================================
+
+      - name: "🆔 Get AnyDesk ID"
+        run: |
+
+          $ErrorActionPreference = "Continue"
+
+          $anydesk =
+            $env:ANYDESK_PATH
+
+          if (
+            [string]::IsNullOrWhiteSpace($anydesk) -or
+            !(Test-Path $anydesk)
+          ) {
+
+            "ANYDESK_ID=unavailable" >> $env:GITHUB_ENV
+
+            exit 0
+          }
+
+          Start-Sleep -Seconds 5
+
+          $id =
+            & $anydesk --get-id 2>$null |
+            Out-String
+
+          $id =
+            $id.Trim()
+
+          if (
+            [string]::IsNullOrWhiteSpace($id)
+          ) {
+
+            $id = "unavailable"
+          }
+
+          "ANYDESK_ID=$id" >> $env:GITHUB_ENV
+
+          Write-Host "AnyDesk ID: $id"
+
+      # ============================================================
+      # TIGHTVNC
+      # ============================================================
+
+      - name: "🖥️ Install VNC Server"
+        run: |
+
+          $ErrorActionPreference = "Continue"
+
+          $choco =
+            "C:\ProgramData\chocolatey\bin\choco.exe"
+
+          & $choco install tightvnc `
+            --yes `
+            --no-progress
+
+          if ($LASTEXITCODE -ne 0) {
+
+            Write-Warning `
+              "TightVNC installation failed."
+
+            "VNC_STATUS=failed" >> $env:GITHUB_ENV
+
+            exit 0
+          }
+
+          $service =
+            Get-Service `
+              -Name tvnserver `
               -ErrorAction SilentlyContinue
 
-          if ($null -eq $python) {
-            throw "Python executable was not found."
+          if ($null -ne $service) {
+
+            Set-Service `
+              -Name tvnserver `
+              -StartupType Automatic
+
+            Start-Service `
+              -Name tvnserver `
+              -ErrorAction SilentlyContinue
           }
 
-          python --version
+          Start-Sleep -Seconds 5
+
+          $listener =
+            Get-NetTCPConnection `
+              -LocalPort 5900 `
+              -State Listen `
+              -ErrorAction SilentlyContinue
+
+          if ($null -eq $listener) {
+
+            Write-Warning `
+              "VNC server is not listening on 5900."
+
+            "VNC_STATUS=not-listening" >> $env:GITHUB_ENV
+          }
+          else {
+
+            Write-Host "VNC is listening on 5900."
+
+            "VNC_STATUS=running" >> $env:GITHUB_ENV
+          }
 
       # ============================================================
       # NOVNC
@@ -401,100 +829,29 @@ jobs:
 
           $ErrorActionPreference = "Stop"
 
-          $root = "C:\noVNC"
-
-          if (Test-Path $root) {
+          if (Test-Path $env:NOVNC_DIR) {
 
             Remove-Item `
-              $root `
+              $env:NOVNC_DIR `
               -Recurse `
               -Force
           }
 
-          Write-Host "Downloading noVNC..."
-
           git clone `
             --depth 1 `
             https://github.com/novnc/noVNC.git `
-            $root
+            $env:NOVNC_DIR
 
-          if (!(Test-Path "$root\vnc.html")) {
+          python -m pip install `
+            --upgrade `
+            websockify
+
+          if (!(Test-Path "$env:NOVNC_DIR\vnc.html")) {
+
             throw "noVNC installation failed."
           }
 
           Write-Host "noVNC installed."
-
-      # ============================================================
-      # WEBSOCKIFY
-      # ============================================================
-
-      - name: "🔌 Install Websockify"
-        run: |
-
-          $ErrorActionPreference = "Stop"
-
-          python -m pip install `
-            --upgrade `
-            pip
-
-          python -m pip install `
-            websockify
-
-          $cmd =
-            Get-Command websockify `
-              -ErrorAction SilentlyContinue
-
-          if ($null -eq $cmd) {
-
-            $cmd =
-              Get-Command websockify.exe `
-                -ErrorAction SilentlyContinue
-          }
-
-          if ($null -eq $cmd) {
-            throw "Websockify installation failed."
-          }
-
-          Write-Host "Websockify installed:"
-          Write-Host $cmd.Source
-
-      # ============================================================
-      # VNC SERVER DETECTION
-      # ============================================================
-
-      - name: "🖥️ Detect VNC Server"
-        run: |
-
-          $ErrorActionPreference = "Continue"
-
-          Write-Host ""
-          Write-Host "Checking VNC server..."
-
-          $vnc =
-            Get-NetTCPConnection `
-              -LocalPort 5900 `
-              -State Listen `
-              -ErrorAction SilentlyContinue
-
-          if ($null -ne $vnc) {
-
-            Write-Host "VNC detected on port 5900."
-
-            "VNC_STATUS=running" >> $env:GITHUB_ENV
-
-          }
-          else {
-
-            Write-Warning `
-              "No VNC server is listening on port 5900."
-
-            Write-Warning `
-              "noVNC will remain installed but cannot display"
-            Write-Warning `
-              "the desktop until a VNC server is available."
-
-            "VNC_STATUS=not-running" >> $env:GITHUB_ENV
-          }
 
       # ============================================================
       # START NOVNC
@@ -505,39 +862,18 @@ jobs:
 
           $ErrorActionPreference = "Continue"
 
-          $vncPort = 5900
-          $webPort = 6080
-
           $vnc =
             Get-NetTCPConnection `
-              -LocalPort $vncPort `
+              -LocalPort 5900 `
               -State Listen `
               -ErrorAction SilentlyContinue
 
           if ($null -eq $vnc) {
 
             Write-Warning `
-              "VNC server unavailable."
+              "No VNC server is listening."
 
-            Write-Warning `
-              "Skipping Websockify."
-
-            "NOVNC_STATUS=waiting-for-vnc" >> $env:GITHUB_ENV
-
-            exit 0
-          }
-
-          $existing =
-            Get-NetTCPConnection `
-              -LocalPort $webPort `
-              -State Listen `
-              -ErrorAction SilentlyContinue
-
-          if ($null -ne $existing) {
-
-            Write-Host "noVNC already running."
-
-            "NOVNC_STATUS=running" >> $env:GITHUB_ENV
+            "NOVNC_STATUS=no-backend" >> $env:GITHUB_ENV
 
             exit 0
           }
@@ -548,18 +884,13 @@ jobs:
           $err =
             "$env:RUNNER_TEMP\novnc-error.log"
 
-          $arguments = @(
-            "6080",
-            "127.0.0.1:5900",
-            "--web",
-            "C:\noVNC"
-          )
-
-          Write-Host "Starting Websockify..."
-
           Start-Process `
             -FilePath "websockify.exe" `
-            -ArgumentList $arguments `
+            -ArgumentList `
+              "6080",
+              "127.0.0.1:5900",
+              "--web",
+              "$env:NOVNC_DIR" `
             -RedirectStandardOutput $log `
             -RedirectStandardError $err `
             -WindowStyle Hidden
@@ -568,17 +899,14 @@ jobs:
 
           $web =
             Get-NetTCPConnection `
-              -LocalPort $webPort `
+              -LocalPort 6080 `
               -State Listen `
               -ErrorAction SilentlyContinue
 
           if ($null -eq $web) {
 
-            Write-Warning "Websockify did not start."
-
-            if (Test-Path $log) {
-              Get-Content $log
-            }
+            Write-Warning `
+              "noVNC did not start."
 
             if (Test-Path $err) {
               Get-Content $err
@@ -589,261 +917,92 @@ jobs:
             exit 0
           }
 
-          Write-Host "noVNC is running on port 6080."
-
           "NOVNC_STATUS=running" >> $env:GITHUB_ENV
 
-      # ============================================================
-      # PLAYIT PREPARATION
-      # ============================================================
-
-      - name: "🌐 Prepare Playit"
-        run: |
-
-          $ErrorActionPreference = "Stop"
-
-          $dir = "C:\playit"
-
-          New-Item `
-            -ItemType Directory `
-            -Path $dir `
-            -Force |
-            Out-Null
-
-          Write-Host ""
-          Write-Host "=================================================="
-          Write-Host "                    PLAYIT"
-          Write-Host "=================================================="
-
-          Write-Host ""
-          Write-Host "Official download:"
-          Write-Host "https://playit.gg/download/"
-
-          Write-Host ""
-          Write-Host "noVNC local endpoint:"
-          Write-Host "127.0.0.1:6080"
-
-          @"
-
-          ## 🌐 Playit
-
-          Configure your Playit tunnel to:
-
-          `127.0.0.1:6080`
-
-          Official Playit:
-
-          https://playit.gg/download/
-
-          "@ |
-            Out-File `
-              $env:GITHUB_STEP_SUMMARY `
-              -Append `
-              -Encoding utf8
+          Write-Host "noVNC running on port 6080."
 
       # ============================================================
-      # DESKTOP SCREENSHOT
+      # FINAL NETWORK INFORMATION
       # ============================================================
 
-      - name: "📸 Capture Desktop Screenshot"
-        run: |
-
-          $ErrorActionPreference = "Stop"
-
-          Add-Type -AssemblyName System.Windows.Forms
-          Add-Type -AssemblyName System.Drawing
-
-          $screens =
-            [System.Windows.Forms.Screen]::AllScreens
-
-          if (
-            $null -eq $screens -or
-            $screens.Count -eq 0
-          ) {
-            throw "No display detected."
-          }
-
-          $left =
-            ($screens |
-              ForEach-Object {
-                $_.Bounds.Left
-              } |
-              Measure-Object -Minimum).Minimum
-
-          $top =
-            ($screens |
-              ForEach-Object {
-                $_.Bounds.Top
-              } |
-              Measure-Object -Minimum).Minimum
-
-          $right =
-            ($screens |
-              ForEach-Object {
-                $_.Bounds.Right
-              } |
-              Measure-Object -Maximum).Maximum
-
-          $bottom =
-            ($screens |
-              ForEach-Object {
-                $_.Bounds.Bottom
-              } |
-              Measure-Object -Maximum).Maximum
-
-          [int]$width =
-            [math]::Max(
-              1,
-              [int]($right - $left)
-            )
-
-          [int]$height =
-            [math]::Max(
-              1,
-              [int]($bottom - $top)
-            )
-
-          Write-Host ""
-          Write-Host "Desktop size: ${width}x${height}"
-
-          $file =
-            Join-Path `
-              $env:GITHUB_WORKSPACE `
-              "desktop-screenshot.png"
-
-          $bitmap = $null
-          $graphics = $null
-
-          try {
-
-            $bitmap =
-              New-Object `
-                System.Drawing.Bitmap(
-                  $width,
-                  $height,
-                  [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
-                )
-
-            $graphics =
-              [System.Drawing.Graphics]::FromImage(
-                $bitmap
-              )
-
-            $graphics.CopyFromScreen(
-              $left,
-              $top,
-              0,
-              0,
-              [System.Drawing.Size]::new(
-                $width,
-                $height
-              ),
-              [System.Drawing.CopyPixelOperation]::SourceCopy
-            )
-
-            $bitmap.Save(
-              $file,
-              [System.Drawing.Imaging.ImageFormat]::Png
-            )
-
-          }
-          finally {
-
-            if ($graphics) {
-              $graphics.Dispose()
-            }
-
-            if ($bitmap) {
-              $bitmap.Dispose()
-            }
-          }
-
-          if (!(Test-Path $file)) {
-            throw "Screenshot was not created."
-          }
-
-          Write-Host "Screenshot created successfully."
-
-      # ============================================================
-      # UPLOAD SCREENSHOT
-      # ============================================================
-
-      - name: "📦 Upload Desktop Screenshot"
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-2025-desktop
-          path: desktop-screenshot.png
-          retention-days: 1
-
-      # ============================================================
-      # SUMMARY
-      # ============================================================
-
-      - name: "📋 Create GitHub Summary"
+      - name: "📋 Remote Access Summary"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
 
           $ErrorActionPreference = "Continue"
 
-          $avica =
-            if ($env:AVICA_STATUS) {
-              $env:AVICA_STATUS
-            }
-            else {
-              "not-installed"
-            }
+          Write-Output "::add-mask::$env:RDP_PASSWORD"
 
-          $vnc =
-            if ($env:VNC_STATUS) {
-              $env:VNC_STATUS
-            }
-            else {
-              "unknown"
-            }
+          $ips =
+            Get-NetIPAddress `
+              -AddressFamily IPv4 `
+              -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.IPAddress -notlike "127.*" -and
+              $_.IPAddress -notlike "169.254.*"
+            } |
+            Select-Object -ExpandProperty IPAddress
 
-          $novnc =
-            if ($env:NOVNC_STATUS) {
-              $env:NOVNC_STATUS
-            }
-            else {
-              "unknown"
-            }
+          $ip =
+            ($ips | Select-Object -First 1)
 
           @"
 
           # 🖥️ Windows Server 2025
 
-          ## 📦 Applications
+          ## 🎮 Playit
 
-          | Application | Status |
-          |---|---|
-          | FileZilla | 🟢 Installed |
-          | Notepad++ | 🟢 Installed |
-          | Avica | $avica |
-          | VNC Server | $vnc |
-          | noVNC | $novnc |
-          | Playit | 🟡 Ready |
+          **Agent:** Claimed
 
-          ## 🔐 RDP
+          **Claim URL:**
+          $env:PLAYIT_CLAIM_URL
 
-          **Username:** `amiraliali3`
-
-          **Password:** `RDP_PASSWORD`
-
-          **Port:** `3389`
-
-          ## 🌐 noVNC
-
-          Local endpoint:
+          **Important:** Playit must have a tunnel configured in your Playit account. The local target for noVNC is:
 
           `127.0.0.1:6080`
 
-          Playit should forward to this endpoint.
+          ## 🔐 RDP
 
-          ## 📸 Screenshot
+          **IP:**
+          `$ip:3389`
 
-          Download the artifact:
+          **Username:**
+          `amiraliali3`
 
-          `windows-2025-desktop`
+          **Password:**
+          `RDP_PASSWORD`
+
+          ## 🟢 AnyDesk
+
+          **AnyDesk ID:**
+          `$env:ANYDESK_ID`
+
+          **Password:**
+          Same value as `RDP_PASSWORD`
+
+          ## 🌐 noVNC
+
+          **Local WebSocket:**
+          `127.0.0.1:6080`
+
+          **VNC backend:**
+          `127.0.0.1:5900`
+
+          **Playit target:**
+          `127.0.0.1:6080`
+
+          **Status:**
+          `$env:NOVNC_STATUS`
+
+          ## 📁 Applications
+
+          - FileZilla
+          - Notepad++
+          - AnyDesk
+          - TightVNC
+          - noVNC
+          - Websockify
 
           ## ⏱️ Runtime
 
@@ -856,10 +1015,10 @@ jobs:
               -Encoding utf8
 
       # ============================================================
-      # KEEP RUNNER ALIVE
+      # KEEP ALIVE
       # ============================================================
 
-      - name: "⏱️ Keep Runner Alive - 5 Hours"
+      - name: "⏱️ Keep Online For 5 Hours"
         run: |
 
           $ErrorActionPreference = "Continue"
@@ -869,10 +1028,9 @@ jobs:
 
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "        WINDOWS SERVER IS READY"
-          Write-Host "        RUNTIME: 5 HOURS"
+          Write-Host "              REMOTE SERVER READY"
+          Write-Host "              RUNTIME: 5 HOURS"
           Write-Host "=================================================="
-          Write-Host ""
 
           for (
             $i = 0;
