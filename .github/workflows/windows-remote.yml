@@ -2,20 +2,13 @@ name: Windows 2025 - Secure Tailscale RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      loops:
-        description: "🔄 Number of chained runs"
-        required: false
-        default: "1"
-        type: string
 
 concurrency:
-  group: windows-tailscale-rdp
+  group: windows-2025-tailscale-rdp
   cancel-in-progress: false
 
 permissions:
   contents: read
-  actions: write
 
 defaults:
   run:
@@ -29,29 +22,26 @@ jobs:
 
     runs-on: windows-2025
 
-    # GitHub-hosted runner maximum is platform-dependent.
-    # 300 minutes = 5 hours.
+    # 5 hours
     timeout-minutes: 300
 
     steps:
 
-      # ============================================================
+      # ==========================================================
       # 1. SYSTEM INFORMATION
-      # ============================================================
+      # ==========================================================
 
-      - name: 🖥️ System Information
+      - name: "🖥️ System Information"
         run: |
-
           $ErrorActionPreference = "Stop"
 
           Write-Host ""
-          Write-Host "=================================================="
-          Write-Host "        WINDOWS SERVER 2025"
-          Write-Host "=================================================="
+          Write-Host "======================================================"
+          Write-Host "             WINDOWS SERVER 2025"
+          Write-Host "======================================================"
 
           $os = Get-ComputerInfo
 
-          Write-Host ""
           Write-Host "OS:"
           Write-Host $os.WindowsProductName
 
@@ -74,297 +64,371 @@ jobs:
 
           $ram = Get-CimInstance Win32_ComputerSystem
 
-          "{0:N2} GB" -f (
-            $ram.TotalPhysicalMemory / 1GB
+          Write-Host (
+            "{0:N2} GB" -f ($ram.TotalPhysicalMemory / 1GB)
           )
 
           Write-Host ""
-          Write-Host "=================================================="
+          Write-Host "======================================================"
 
-      # ============================================================
+      # ==========================================================
       # 2. CONNECT TAILSCALE
-      # ============================================================
+      #
+      # IMPORTANT:
+      # DO NOT PASS --hostname HERE.
+      # The previous error was caused by hostname being supplied twice.
+      # ==========================================================
 
-      - name: 🌐 Connect to Tailscale
+      - name: "🌐 Connect to Tailscale"
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          args: "--hostname=amiraliali3-${{ github.run_number }}"
+          log-mode: normal
 
-      # ============================================================
-      # 3. VERIFY TAILSCALE
-      # ============================================================
+      # ==========================================================
+      # 3. CONFIGURE TAILSCALE
+      # ==========================================================
 
-      - name: 🌐 Verify Tailscale
+      - name: "🌐 Configure Tailscale"
         run: |
 
           $ErrorActionPreference = "Stop"
 
-          $tailscale = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (!(Test-Path $tailscale)) {
-
-              $tailscale = `
-                "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+            $tailscale = "$env:ProgramFiles(x86)\Tailscale\tailscale.exe"
           }
 
           if (!(Test-Path $tailscale)) {
-
-              throw "Tailscale executable not found."
+            throw "Tailscale executable not found."
           }
+
+          # Unique node name for this GitHub runner.
+          $hostname = "amiraliali3-${{ github.run_number }}"
 
           Write-Host ""
-          Write-Host "=================================================="
-          Write-Host "        TAILSCALE CONNECTION"
-          Write-Host "=================================================="
+          Write-Host "Setting Tailscale hostname:"
+          Write-Host $hostname
+
+          & $tailscale set "--hostname=$hostname"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "tailscale set --hostname failed."
+          }
 
           Start-Sleep -Seconds 5
 
+          Write-Host ""
+          Write-Host "Tailscale status:"
           & $tailscale status
 
-          Write-Host ""
+          # --------------------------------------------------------
+          # Wait until IPv4 is available
+          # --------------------------------------------------------
 
-          $ip = (
-              & $tailscale ip -4 |
+          $ip = $null
+
+          for ($attempt = 1; $attempt -le 30; $attempt++) {
+
+            $ip = (
+              & $tailscale ip -4 2>$null |
               Select-Object -First 1
-          ).Trim()
+            ).Trim()
+
+            if (-not [string]::IsNullOrWhiteSpace($ip)) {
+              break
+            }
+
+            Write-Host "Waiting for Tailscale IPv4... attempt $attempt/30"
+
+            Start-Sleep -Seconds 2
+          }
 
           if ([string]::IsNullOrWhiteSpace($ip)) {
-
-              throw "Tailscale IPv4 was not detected."
+            throw "Tailscale IPv4 was not available after 60 seconds."
           }
 
-          $statusRaw = & $tailscale status --json
+          # --------------------------------------------------------
+          # Get DNS name from Tailscale
+          # --------------------------------------------------------
 
-          if ([string]::IsNullOrWhiteSpace($statusRaw)) {
+          $dnsName = $null
 
-              throw "Tailscale JSON status unavailable."
-          }
+          try {
 
-          $status = $statusRaw | ConvertFrom-Json
+            $json = & $tailscale status --json 2>$null
 
-          $hostname = $status.Self.HostName
+            if (-not [string]::IsNullOrWhiteSpace($json)) {
 
-          $dnsName = $status.Self.DNSName
+              $status = $json | ConvertFrom-Json
 
-          if ([string]::IsNullOrWhiteSpace($hostname)) {
+              $dnsName = $status.Self.DNSName
+            }
 
-              $hostname = "amiraliali3-${{ github.run_number }}"
+          } catch {
+
+            Write-Host "Unable to read DNSName from JSON status."
           }
 
           if ([string]::IsNullOrWhiteSpace($dnsName)) {
 
-              $dnsName = $hostname
+            $dnsName = $hostname
 
           } else {
 
-              $dnsName = $dnsName.TrimEnd(".")
+            $dnsName = $dnsName.TrimEnd(".")
           }
 
+          # Save values for later steps.
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-
           "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
-
           "TAILSCALE_DOMAIN=$dnsName" >> $env:GITHUB_ENV
 
           Write-Host ""
-          Write-Host "Tailscale connected."
+          Write-Host "Tailscale successfully connected."
           Write-Host "Hostname detected: $hostname"
 
-          # Deliberately don't expose IP yet.
-          # Screenshot comes first.
+          # Do NOT print IP or domain here.
+          # Screenshot must happen first.
 
-      # ============================================================
+      # ==========================================================
       # 4. INSTALL FILEZILLA
-      # ============================================================
+      # ==========================================================
 
-      - name: 📁 Install FileZilla
+      - name: "📁 Install FileZilla"
         run: |
 
           $ErrorActionPreference = "Stop"
 
-          Write-Host ""
-          Write-Host "Installing FileZilla..."
-
-          $choco = `
-            "C:\ProgramData\chocolatey\bin\choco.exe"
+          $choco = "$env:ProgramData\chocolatey\bin\choco.exe"
 
           if (!(Test-Path $choco)) {
-
-              throw "Chocolatey was not found."
+            throw "Chocolatey was not found on windows-2025."
           }
+
+          Write-Host "Installing FileZilla..."
 
           & $choco install filezilla `
             --yes `
             --no-progress
 
-          if ($LASTEXITCODE -ne 0) {
+          $exitCode = $LASTEXITCODE
 
-              throw "FileZilla installation failed."
+          Write-Host "Chocolatey exit code: $exitCode"
+
+          # Chocolatey package installation normally returns 0
+          # for success. Fail immediately otherwise.
+
+          if ($exitCode -ne 0) {
+            throw "FileZilla installation failed. Exit code: $exitCode"
           }
 
-          Write-Host "FileZilla installed successfully."
+          Write-Host "FileZilla installation completed."
 
-      # ============================================================
+      # ==========================================================
       # 5. VERIFY FILEZILLA
-      # ============================================================
+      # ==========================================================
 
-      - name: 📁 Verify FileZilla
-        run: |
-
-          $paths = @(
-
-            "$env:ProgramFiles\FileZilla FTP Client\filezilla.exe",
-
-            "${env:ProgramFiles(x86)}\FileZilla FTP Client\filezilla.exe"
-
-          )
-
-          $found = $null
-
-          foreach ($path in $paths) {
-
-              if (Test-Path $path) {
-
-                  $found = $path
-                  break
-              }
-          }
-
-          if (!$found) {
-
-              $found = Get-ChildItem `
-                "$env:ProgramFiles" `
-                -Filter "filezilla.exe" `
-                -Recurse `
-                -ErrorAction SilentlyContinue |
-                Select-Object -First 1 |
-                Select-Object -ExpandProperty FullName
-          }
-
-          if (!$found) {
-
-              throw "FileZilla executable was not found."
-          }
-
-          Write-Host "FileZilla:"
-          Write-Host $found
-
-      # ============================================================
-      # 6. INSTALL NOTEPAD++
-      # ============================================================
-
-      - name: 📝 Install Notepad++
+      - name: "📁 Verify FileZilla"
         run: |
 
           $ErrorActionPreference = "Stop"
 
-          $version = "8.9.7"
+          $possiblePaths = @(
+            "$env:ProgramFiles\FileZilla FTP Client\filezilla.exe",
+            "$env:ProgramFiles(x86)\FileZilla FTP Client\filezilla.exe"
+          )
 
-          $url = `
-            "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v$version/npp.$version.Installer.x64.exe"
+          $filezilla = $null
 
-          $installer = Join-Path `
-            $env:TEMP `
-            "npp-installer.exe"
+          foreach ($path in $possiblePaths) {
 
-          Write-Host ""
-          Write-Host "Downloading Notepad++..."
+            if (Test-Path $path) {
+              $filezilla = $path
+              break
+            }
+          }
 
-          Invoke-WebRequest `
-            -Uri $url `
-            -OutFile $installer `
-            -UseBasicParsing
+          if ($null -eq $filezilla) {
 
-          if (!(Test-Path $installer)) {
+            $filezilla = Get-ChildItem `
+              "$env:ProgramFiles" `
+              -Filter "filezilla.exe" `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1 |
+              Select-Object -ExpandProperty FullName
+          }
 
-              throw "Notepad++ download failed."
+          if ([string]::IsNullOrWhiteSpace($filezilla)) {
+            throw "FileZilla executable was not found after installation."
+          }
+
+          Write-Host "FileZilla verified:"
+          Write-Host $filezilla
+
+      # ==========================================================
+      # 6. INSTALL NOTEPAD++
+      # ==========================================================
+
+      - name: "📝 Install Notepad++"
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          $choco = "$env:ProgramData\chocolatey\bin\choco.exe"
+
+          if (!(Test-Path $choco)) {
+            throw "Chocolatey was not found."
           }
 
           Write-Host "Installing Notepad++..."
 
-          $process = Start-Process `
-            -FilePath $installer `
-            -ArgumentList "/S" `
-            -Wait `
-            -PassThru `
-            -NoNewWindow
+          # Current Chocolatey package verified in July 2026.
+          & $choco install notepadplusplus.install `
+            --yes `
+            --no-progress
 
-          if ($process.ExitCode -ne 0) {
+          $exitCode = $LASTEXITCODE
 
-              throw "Notepad++ installation failed."
+          Write-Host "Chocolatey exit code: $exitCode"
+
+          if ($exitCode -ne 0) {
+            throw "Notepad++ installation failed. Exit code: $exitCode"
           }
 
-          Remove-Item `
-            $installer `
-            -Force `
-            -ErrorAction SilentlyContinue
+          Write-Host "Notepad++ installation completed."
 
-          Write-Host "Notepad++ installed."
-
-      # ============================================================
+      # ==========================================================
       # 7. VERIFY NOTEPAD++
-      # ============================================================
+      # ==========================================================
 
-      - name: 📝 Verify Notepad++
-        run: |
-
-          $paths = @(
-
-            "$env:ProgramFiles\Notepad++\notepad++.exe",
-
-            "${env:ProgramFiles(x86)}\Notepad++\notepad++.exe"
-
-          )
-
-          $found = $null
-
-          foreach ($path in $paths) {
-
-              if (Test-Path $path) {
-
-                  $found = $path
-                  break
-              }
-          }
-
-          if (!$found) {
-
-              throw "Notepad++ executable was not found."
-          }
-
-          Write-Host "Notepad++:"
-          Write-Host $found
-
-      # ============================================================
-      # 8. ENABLE RDP
-      # ============================================================
-
-      - name: 🖥️ Enable Remote Desktop
+      - name: "📝 Verify Notepad++"
         run: |
 
           $ErrorActionPreference = "Stop"
 
-          Write-Host ""
+          $possiblePaths = @(
+            "$env:ProgramFiles\Notepad++\notepad++.exe",
+            "$env:ProgramFiles(x86)\Notepad++\notepad++.exe"
+          )
+
+          $notepad = $null
+
+          foreach ($path in $possiblePaths) {
+
+            if (Test-Path $path) {
+              $notepad = $path
+              break
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($notepad)) {
+            throw "Notepad++ executable was not found."
+          }
+
+          Write-Host "Notepad++ verified:"
+          Write-Host $notepad
+
+      # ==========================================================
+      # 8. CONFIGURE LOCAL PASSWORD POLICY
+      #
+      # The requested password can otherwise be rejected by the
+      # Windows complexity policy.
+      # ==========================================================
+
+      - name: "🔐 Configure Local Password Policy"
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          $cfg = Join-Path `
+            $env:TEMP `
+            "local-security.inf"
+
+          $db = Join-Path `
+            $env:TEMP `
+            "local-security.sdb"
+
+          Write-Host "Exporting local security policy..."
+
+          secedit /export `
+            /cfg "$cfg" `
+            /quiet
+
+          if (!(Test-Path $cfg)) {
+            throw "Failed to export local security policy."
+          }
+
+          $content = Get-Content `
+            "$cfg" `
+            -Raw
+
+          if ($content -match 'PasswordComplexity\s*=') {
+
+            $content = [regex]::Replace(
+              $content,
+              'PasswordComplexity\s*=\s*\d+',
+              'PasswordComplexity = 0'
+            )
+
+          } else {
+
+            $content += "`r`nPasswordComplexity = 0`r`n"
+          }
+
+          Set-Content `
+            -Path "$cfg" `
+            -Value $content `
+            -Encoding Unicode
+
+          secedit /configure `
+            /db "$db" `
+            /cfg "$cfg" `
+            /areas SECURITYPOLICY `
+            /quiet
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to apply local password policy."
+          }
+
+          gpupdate /force | Out-Null
+
+          Start-Sleep -Seconds 3
+
+          Write-Host "Password complexity policy configured."
+
+      # ==========================================================
+      # 9. ENABLE RDP
+      # ==========================================================
+
+      - name: "🖥️ Enable Remote Desktop"
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
           Write-Host "Enabling Remote Desktop..."
 
+          # Enable RDP.
           Set-ItemProperty `
-            -Path `
-            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
             -Name "fDenyTSConnections" `
             -Value 0 `
             -Force
 
+          # Keep Network Level Authentication enabled.
           Set-ItemProperty `
-            -Path `
-            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
             -Name "UserAuthentication" `
             -Value 1 `
             -Force
 
+          # Enable Windows built-in RDP firewall rules.
           Enable-NetFirewallRule `
             -DisplayGroup "Remote Desktop"
 
+          # Ensure service is automatic and running.
           Set-Service `
             -Name "TermService" `
             -StartupType Automatic
@@ -373,9 +437,8 @@ jobs:
             -Name "TermService"
 
           if ($service.Status -ne "Running") {
-
-              Start-Service `
-                -Name "TermService"
+            Start-Service `
+              -Name "TermService"
           }
 
           Start-Sleep -Seconds 3
@@ -384,17 +447,16 @@ jobs:
             -Name "TermService"
 
           if ($service.Status -ne "Running") {
-
-              throw "TermService failed to start."
+            throw "Remote Desktop Service failed to start."
           }
 
-          Write-Host "RDP enabled."
+          Write-Host "Remote Desktop enabled."
 
-      # ============================================================
-      # 9. CREATE RDP USER
-      # ============================================================
+      # ==========================================================
+      # 10. CREATE RDP USER
+      # ==========================================================
 
-      - name: 👤 Create RDP User
+      - name: "👤 Create RDP User"
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
@@ -404,16 +466,16 @@ jobs:
           $username = "amiraliali3"
 
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-
-              throw "RDP_PASSWORD secret is missing."
+            throw "RDP_PASSWORD secret is missing."
           }
+
+          # Prevent accidental log exposure.
+          Write-Output "::add-mask::$env:RDP_PASSWORD"
 
           $securePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD `
             -AsPlainText `
             -Force
-
-          Write-Output "::add-mask::$env:RDP_PASSWORD"
 
           $existing = Get-LocalUser `
             -Name $username `
@@ -421,29 +483,26 @@ jobs:
 
           if ($null -eq $existing) {
 
-              New-LocalUser `
-                -Name $username `
-                -Password $securePassword `
-                -FullName "amiraliali3" `
-                -Description "Temporary RDP user" `
-                -PasswordNeverExpires:$true `
-                -AccountNeverExpires:$true
+            Write-Host "Creating RDP user..."
 
-              Write-Host "User created."
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -FullName "amiraliali3" `
+              -Description "Temporary GitHub Actions RDP User" `
+              -PasswordNeverExpires:$true `
+              -AccountNeverExpires:$true
 
           } else {
 
-              Set-LocalUser `
-                -Name $username `
-                -Password $securePassword
+            Write-Host "RDP user already exists."
 
-              Write-Host "Existing user password updated."
+            Set-LocalUser `
+              -Name $username `
+              -Password $securePassword
           }
 
-          # ----------------------------------------------------------
-          # Remote Desktop Users
-          # ----------------------------------------------------------
-
+          # Add user to Remote Desktop Users.
           $member = Get-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -ErrorAction SilentlyContinue |
@@ -453,25 +512,26 @@ jobs:
 
           if ($null -eq $member) {
 
-              Add-LocalGroupMember `
-                -Group "Remote Desktop Users" `
-                -Member $username
+            Add-LocalGroupMember `
+              -Group "Remote Desktop Users" `
+              -Member $username
           }
 
-          # ----------------------------------------------------------
-          # Save username only
-          # ----------------------------------------------------------
+          # Never add the user to Administrators.
+          # RDP does not require local administrator membership.
 
           "RDP_USERNAME=$username" >> $env:GITHUB_ENV
 
-          Write-Host "RDP user configured."
+          Write-Host "RDP user configured successfully."
 
-      # ============================================================
-      # 10. VERIFY RDP PORT
-      # ============================================================
+      # ==========================================================
+      # 11. VERIFY RDP PORT
+      # ==========================================================
 
-      - name: 🔍 Verify RDP
+      - name: "🔍 Verify RDP TCP 3389"
         run: |
+
+          $ErrorActionPreference = "Stop"
 
           Start-Sleep -Seconds 3
 
@@ -481,44 +541,45 @@ jobs:
             -ErrorAction SilentlyContinue
 
           if ($null -eq $listener) {
-
-              throw "RDP TCP 3389 is not listening."
+            throw "RDP is not listening on TCP 3389."
           }
 
           Write-Host "RDP TCP 3389 is listening."
 
-      # ============================================================
-      # 11. WAIT FOR DESKTOP
-      # ============================================================
+      # ==========================================================
+      # 12. WAIT FOR DESKTOP
+      # ==========================================================
 
-      - name: 🖥️ Prepare Desktop
+      - name: "🖥️ Prepare Desktop"
         run: |
 
           Write-Host "Preparing desktop..."
 
           Start-Sleep -Seconds 20
 
-      # ============================================================
-      # 12. SCREENSHOT
+      # ==========================================================
+      # 13. CAPTURE SCREENSHOT
       #
-      # This happens BEFORE exposing Tailscale IP/domain.
-      # ============================================================
+      # IMPORTANT:
+      # Tailscale IP / DNS are NOT printed until after this step.
+      # ==========================================================
 
-      - name: 📸 Capture Desktop
+      - name: "📸 Capture Desktop Screenshot"
         run: |
 
           $ErrorActionPreference = "Stop"
 
-          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type `
+            -AssemblyName System.Windows.Forms
 
-          Add-Type -AssemblyName System.Drawing
+          Add-Type `
+            -AssemblyName System.Drawing
 
           $screens = `
             [System.Windows.Forms.Screen]::AllScreens
 
-          if ($screens.Count -eq 0) {
-
-              throw "No display detected."
+          if ($null -eq $screens -or $screens.Count -eq 0) {
+            throw "No display was detected."
           }
 
           $left = (
@@ -554,8 +615,9 @@ jobs:
           ).Maximum
 
           $width = $right - $left
-
           $height = $bottom - $top
+
+          Write-Host "Desktop size: ${width}x${height}"
 
           $file = Join-Path `
             $env:GITHUB_WORKSPACE `
@@ -571,134 +633,140 @@ jobs:
 
           try {
 
-              $graphics.CopyFromScreen(
-                $left,
-                $top,
-                0,
-                0,
-                $bitmap.Size
-              )
+            $graphics.CopyFromScreen(
+              $left,
+              $top,
+              0,
+              0,
+              $bitmap.Size
+            )
 
-              $bitmap.Save(
-                $file,
-                [System.Drawing.Imaging.ImageFormat]::Png
-              )
+            $bitmap.Save(
+              $file,
+              [System.Drawing.Imaging.ImageFormat]::Png
+            )
 
           }
           finally {
 
-              $graphics.Dispose()
+            $graphics.Dispose()
 
-              $bitmap.Dispose()
+            $bitmap.Dispose()
           }
 
           if (!(Test-Path $file)) {
-
-              throw "Screenshot was not created."
+            throw "Desktop screenshot was not created."
           }
 
-          Write-Host "Screenshot created:"
-          Write-Host $file
+          Write-Host "Screenshot created successfully."
 
-      # ============================================================
-      # 13. UPLOAD SCREENSHOT
-      # ============================================================
+      # ==========================================================
+      # 14. UPLOAD SCREENSHOT
+      # ==========================================================
 
-      - name: 📦 Upload Screenshot
+      - name: "📦 Upload Desktop Screenshot"
         uses: actions/upload-artifact@v4
         with:
-          name: windows-2025-desktop
+          name: windows-2025-desktop-screenshot
           path: desktop-screenshot.png
           if-no-files-found: error
           retention-days: 1
 
-      # ============================================================
-      # 14. CREATE SUMMARY
-      # ============================================================
+      # ==========================================================
+      # 15. CREATE GITHUB SUMMARY
+      # ==========================================================
 
-      - name: 📋 GitHub Actions Summary
+      - name: "📋 Create GitHub Summary"
+        env:
+          TS_IP: ${{ env.TAILSCALE_IP }}
+          TS_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+          TS_DOMAIN: ${{ env.TAILSCALE_DOMAIN }}
         run: |
 
-          $summary = @"
+          $artifactUrl = `
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+          $summary = @"
           # 🖥️ Windows Server 2025
 
-          ## 🟢 Server Status
+          ## 🟢 Status
 
           | Component | Status |
           |---|---|
           | Windows Server 2025 | 🟢 Online |
           | Tailscale | 🟢 Connected |
-          | Remote Desktop | 🟢 Enabled |
+          | RDP | 🟢 Enabled |
           | FileZilla | 🟢 Installed |
           | Notepad++ | 🟢 Installed |
-          | Runner | 🟢 Active |
+          | Screenshot | 🟢 Captured |
 
           ---
 
           ## 📸 Desktop Screenshot
 
-          Screenshot was captured **before the connection information was displayed**.
+          The screenshot was captured **before the IP and DNS information was exposed**.
 
-          Screenshot artifact:
+          **[📥 Open workflow artifacts]($artifactUrl)**
 
-          **windows-2025-desktop**
+          Artifact:
+
+          `windows-2025-desktop-screenshot`
 
           ---
 
           ## 🌐 Tailscale
 
-          ### IPv4
+          **IPv4**
 
-          ``````
-          $env:TAILSCALE_IP
-          ``````
+          ```
+          $env:TS_IP
+          ```
 
-          ### Hostname
+          **Machine Name**
 
-          ``````
-          $env:TAILSCALE_HOSTNAME
-          ``````
+          ```
+          $env:TS_HOSTNAME
+          ```
 
-          ### MagicDNS
+          **MagicDNS**
 
-          ``````
-          $env:TAILSCALE_DOMAIN
-          ``````
+          ```
+          $env:TS_DOMAIN
+          ```
 
           ---
 
-          ## 🖥️ RDP
+          ## 🖥️ Remote Desktop
 
-          ### IP
+          **RDP IP**
 
-          ``````
-          $env:TAILSCALE_IP`:3389
-          ``````
+          ```
+          $env:TS_IP:3389
+          ```
 
-          ### Domain
+          **RDP Domain**
 
-          ``````
-          $env:TAILSCALE_DOMAIN`:3389
-          ``````
+          ```
+          $env:TS_DOMAIN:3389
+          ```
 
-          ### Username
+          **Username**
 
-          ``````
+          ```
           amiraliali3
-          ``````
+          ```
 
-          > 🔐 The RDP password is stored as a GitHub Actions Secret and is intentionally not written to the Summary.
+          **Password**
+
+          The password is stored in the `RDP_PASSWORD` GitHub Secret and is not written into this Summary.
 
           ---
 
           ## ⏱️ Runtime
 
-          This runner is configured for a maximum runtime of **5 hours**.
+          This workflow keeps the runner alive for approximately **5 hours**.
 
-          ---
-
-          ⚠️ **Important:** GitHub-hosted runners are temporary machines and are destroyed after the workflow ends.
+          > GitHub-hosted runners are temporary and are destroyed when the workflow ends.
 
           "@
 
@@ -707,13 +775,13 @@ jobs:
               -FilePath $env:GITHUB_STEP_SUMMARY `
               -Encoding utf8
 
-      # ============================================================
-      # 15. CONNECTION INFORMATION
+      # ==========================================================
+      # 16. SHOW CONNECTION INFORMATION
       #
-      # Screenshot has already been taken.
-      # ============================================================
+      # This is intentionally AFTER screenshot.
+      # ==========================================================
 
-      - name: 🔗 Show Connection Information
+      - name: "🔗 Show Connection Information"
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
@@ -726,12 +794,24 @@ jobs:
           Write-Host "=========================================================="
 
           Write-Host ""
-          Write-Host "RDP Address:"
-          Write-Host "$env:TAILSCALE_IP`:3389"
+          Write-Host "Tailscale IPv4:"
+          Write-Host $env:TAILSCALE_IP
+
+          Write-Host ""
+          Write-Host "Tailscale Hostname:"
+          Write-Host $env:TAILSCALE_HOSTNAME
+
+          Write-Host ""
+          Write-Host "MagicDNS:"
+          Write-Host $env:TAILSCALE_DOMAIN
+
+          Write-Host ""
+          Write-Host "RDP IP:"
+          Write-Host "$($env:TAILSCALE_IP):3389"
 
           Write-Host ""
           Write-Host "RDP Domain:"
-          Write-Host "$env:TAILSCALE_DOMAIN`:3389"
+          Write-Host "$($env:TAILSCALE_DOMAIN):3389"
 
           Write-Host ""
           Write-Host "Username:"
@@ -742,84 +822,82 @@ jobs:
           Write-Host $env:RDP_PASSWORD
 
           Write-Host ""
-          Write-Host "Tailscale Hostname:"
-          Write-Host $env:TAILSCALE_HOSTNAME
-
-          Write-Host ""
           Write-Host "=========================================================="
 
-      # ============================================================
-      # 16. KEEP RUNNER ALIVE
-      # ============================================================
+      # ==========================================================
+      # 17. KEEP RUNNER ALIVE
+      # ==========================================================
 
-      - name: ⏱️ Keep Runner Online
+      - name: "⏱️ Keep Runner Online For 5 Hours"
         run: |
 
           $totalSeconds = 5 * 60 * 60
 
           Write-Host ""
-          Write-Host "=================================================="
-          Write-Host "       REMOTE WINDOWS SERVER IS ONLINE"
+          Write-Host "======================================================"
+          Write-Host "       WINDOWS SERVER 2025 IS ONLINE"
           Write-Host "       RUNTIME: 5 HOURS"
-          Write-Host "=================================================="
+          Write-Host "======================================================"
+          Write-Host ""
 
           for ($i = 0; $i -lt $totalSeconds; $i++) {
 
-              if (($i % 60) -eq 0) {
+            if (($i % 60) -eq 0) {
 
-                  $remaining = $totalSeconds - $i
+              $remaining = $totalSeconds - $i
 
-                  $hours = [math]::Floor(
-                    $remaining / 3600
-                  )
+              $hours = [math]::Floor(
+                $remaining / 3600
+              )
 
-                  $minutes = [math]::Floor(
-                    ($remaining % 3600) / 60
-                  )
+              $minutes = [math]::Floor(
+                ($remaining % 3600) / 60
+              )
 
-                  Write-Host `
-                    "[$(Get-Date -Format 'HH:mm:ss')] Remaining: ${hours}h ${minutes}m"
-              }
+              Write-Host `
+                "[$(Get-Date -Format 'HH:mm:ss')] Remaining: ${hours}h ${minutes}m"
+            }
 
-              Start-Sleep -Seconds 1
+            Start-Sleep -Seconds 1
           }
 
           Write-Host ""
           Write-Host "5-hour runtime completed."
 
-      # ============================================================
-      # 17. CLEANUP
-      # ============================================================
+      # ==========================================================
+      # 18. CLEANUP
+      # ==========================================================
 
-      - name: 🧹 Cleanup
+      - name: "🧹 Cleanup Tailscale"
         if: always()
         run: |
 
           Write-Host ""
           Write-Host "Cleaning up Tailscale..."
 
-          $tailscale = `
-            "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (!(Test-Path $tailscale)) {
-
-              $tailscale = `
-                "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+            $tailscale = "$env:ProgramFiles(x86)\Tailscale\tailscale.exe"
           }
 
           if (Test-Path $tailscale) {
 
-              try {
+            try {
 
-                  & $tailscale logout
+              & $tailscale logout
 
-                  Write-Host "Tailscale disconnected."
+              Write-Host "Tailscale disconnected."
 
-              }
-              catch {
+            }
+            catch {
 
-                  Write-Host "Tailscale cleanup completed."
-              }
+              Write-Host "Tailscale cleanup completed."
+            }
+
+          } else {
+
+            Write-Host "Tailscale executable not found."
           }
 
-          Write-Host "Cleanup finished."
+          Write-Host "Cleanup completed."
