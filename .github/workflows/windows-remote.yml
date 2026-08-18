@@ -1,994 +1,113 @@
-name: DAO Windows Server 2025
+name: RDP
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
-concurrency:
-  group: dao-windows-server-2025
-  cancel-in-progress: true
-
 jobs:
-  desktop:
-    name: Windows Server 2025 Desktop
-    runs-on: windows-2025
-    timeout-minutes: 330
-
-    env:
-      PLAYIT_MSI_URL: "https://builds.playit.gg/1.0.10/playit-windows-x86_64-signed.msi"
-      WORKSPACE_DIR: "C:\\DAO-Desktop"
-      NOVNC_DIR: "C:\\DAO-Desktop\\noVNC"
-      VNC_PORT: "5900"
-      NOVNC_PORT: "6080"
-      RUNTIME_MINUTES: "300"
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 320
 
     steps:
-      - name: Initialize workspace
-        shell: pwsh
+      - name: Configure Core RDP Settings
         run: |
-          $ErrorActionPreference = "Stop"
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          if (-not (Test-Path -LiteralPath $env:WORKSPACE_DIR)) {
-            New-Item `
-              -Path $env:WORKSPACE_DIR `
-              -ItemType Directory `
-              -Force | Out-Null
-          }
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-          $os = Get-CimInstance Win32_OperatingSystem
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
-          Write-Host "OS: $($os.Caption)"
-          Write-Host "Version: $($os.Version)"
-          Write-Host "Build: $($os.BuildNumber)"
-
-          if ($os.Caption -notmatch "Windows Server 2025") {
-            throw "This workflow requires Windows Server 2025."
-          }
-
-      - name: Download Playit MSI
-        shell: pwsh
+      - name: Create RDP User with Secure Password
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $installer = Join-Path `
-            $env:RUNNER_TEMP `
-            "playit-1.0.10.msi"
-
-          Remove-Item `
-            -LiteralPath $installer `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          $downloaded = $false
-
-          for ($attempt = 1; $attempt -le 5; $attempt++) {
-            Write-Host "Playit download attempt $attempt/5"
-
-            try {
-              $curl = Get-Command `
-                curl.exe `
-                -ErrorAction SilentlyContinue
-
-              if ($curl) {
-                & curl.exe `
-                  --location `
-                  --fail `
-                  --silent `
-                  --show-error `
-                  --retry 3 `
-                  --retry-delay 5 `
-                  --connect-timeout 30 `
-                  --max-time 180 `
-                  --user-agent "Mozilla/5.0 GitHub-Actions" `
-                  --output $installer `
-                  $env:PLAYIT_MSI_URL
-
-                if ($LASTEXITCODE -eq 0 -and (Test-Path $installer)) {
-                  $size = (Get-Item $installer).Length
-
-                  if ($size -gt 100000) {
-                    $downloaded = $true
-                    break
-                  }
-                }
-              }
-            }
-            catch {
-              Write-Warning $_.Exception.Message
-            }
-
-            Remove-Item `
-              -LiteralPath $installer `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-            try {
-              Invoke-WebRequest `
-                -Uri $env:PLAYIT_MSI_URL `
-                -OutFile $installer `
-                -UseBasicParsing `
-                -TimeoutSec 180 `
-                -Headers @{
-                  "User-Agent" = "Mozilla/5.0 GitHub-Actions"
-                  "Accept" = "*/*"
-                }
-
-              if (Test-Path $installer) {
-                $size = (Get-Item $installer).Length
-
-                if ($size -gt 100000) {
-                  $downloaded = $true
-                  break
-                }
-              }
-            }
-            catch {
-              Write-Warning $_.Exception.Message
-            }
-
-            Start-Sleep -Seconds 10
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-          if (-not $downloaded) {
-            Write-Host ""
-            Write-Host "Playit download failed."
-            Write-Host ""
-
-            Resolve-DnsName `
-              "builds.playit.gg" `
-              -ErrorAction SilentlyContinue
-
-            Test-NetConnection `
-              "builds.playit.gg" `
-              -Port 443 `
-              -WarningAction SilentlyContinue
-
-            throw "Unable to download Playit MSI."
-          }
-
-          $signature = Get-AuthenticodeSignature `
-            -LiteralPath $installer
-
-          Write-Host "Signature status: $($signature.Status)"
-
-          if ($signature.Status -ne "Valid") {
-            throw "Playit MSI signature verification failed."
-          }
-
-          "PLAYIT_INSTALLER=$installer" |
-            Out-File `
-              -FilePath $env:GITHUB_ENV `
-              -Encoding utf8 `
-              -Append
-
-      - name: Remove previous Playit installation
-        shell: pwsh
+      - name: Install Tailscale
         run: |
-          $ErrorActionPreference = "Continue"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          Get-Process `
-            -Name "playit" `
-            -ErrorAction SilentlyContinue |
-            Stop-Process `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-          $uninstallLocations = @(
-            "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*",
-            "HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*",
-            "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*"
-          )
-
-          foreach ($location in $uninstallLocations) {
-            $items = Get-ItemProperty `
-              -Path $location `
-              -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.DisplayName -match "(?i)playit"
-              }
-
-            foreach ($item in $items) {
-              if ($item.PSChildName -match "^\\{.+\\}$") {
-                Write-Host "Removing previous Playit installation..."
-
-                Start-Process `
-                  -FilePath "msiexec.exe" `
-                  -ArgumentList @(
-                    "/x",
-                    $item.PSChildName,
-                    "/qn",
-                    "/norestart"
-                  ) `
-                  -Wait `
-                  -WindowStyle Hidden
-              }
-            }
-          }
-
-          Start-Sleep -Seconds 5
-
-      - name: Install Playit 1.0.10
-        shell: pwsh
+      - name: Establish Tailscale Connection
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $process = Start-Process `
-            -FilePath "msiexec.exe" `
-            -ArgumentList @(
-              "/i",
-              "`"$env:PLAYIT_INSTALLER`"",
-              "/qn",
-              "/norestart"
-            ) `
-            -Wait `
-            -PassThru `
-            -WindowStyle Hidden
-
-          if ($process.ExitCode -notin @(0, 3010)) {
-            throw "Playit installation failed. Exit code: $($process.ExitCode)"
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-
-          Start-Sleep -Seconds 5
-
-      - name: Locate playit.exe
-        shell: pwsh
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $candidates = @()
-
-          $command = Get-Command `
-            "playit.exe" `
-            -ErrorAction SilentlyContinue
-
-          if ($command) {
-            $candidates += $command.Source
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
+          Write-Host "TCP connectivity successful!"
 
-          $knownPaths = @(
-            "$env:ProgramFiles\\playit\\playit.exe",
-            "$env:ProgramFiles\\Playit\\playit.exe",
-            "${env:ProgramFiles(x86)}\\playit\\playit.exe",
-            "${env:ProgramFiles(x86)}\\Playit\\playit.exe",
-            "$env:LOCALAPPDATA\\playit\\playit.exe",
-            "$env:LOCALAPPDATA\\Playit\\playit.exe"
-          )
-
-          $candidates += $knownPaths
-
-          $playit = $candidates |
-            Where-Object {
-              $_ -and (Test-Path -LiteralPath $_)
-            } |
-            Select-Object -First 1
-
-          if (-not $playit) {
-            $roots = @(
-              $env:ProgramFiles,
-              ${env:ProgramFiles(x86)},
-              $env:LOCALAPPDATA
-            ) |
-            Where-Object {
-              $_ -and (Test-Path -LiteralPath $_)
-            }
-
-            $playit = Get-ChildItem `
-              -Path $roots `
-              -Filter "playit.exe" `
-              -File `
-              -Recurse `
-              -ErrorAction SilentlyContinue |
-              Select-Object -First 1 -ExpandProperty FullName
-          }
-
-          if (-not $playit) {
-            throw "playit.exe was not found."
-          }
-
-          Write-Host "Playit executable:"
-          Write-Host $playit
-
-          "PLAYIT_EXE=$playit" |
-            Out-File `
-              -FilePath $env:GITHUB_ENV `
-              -Encoding utf8 `
-              -Append
-
-      - name: Verify Playit CLI
-        shell: pwsh
+      - name: Maintain Connection
         run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "========== playit --help =========="
-
-          & $env:PLAYIT_EXE --help
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "playit --help failed."
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
           }
-
-          Write-Host ""
-          Write-Host "========== playit claim --help =========="
-
-          & $env:PLAYIT_EXE claim --help
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "playit claim --help failed."
-          }
-
-      - name: Start Playit agent
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $stdout = Join-Path `
-            $env:WORKSPACE_DIR `
-            "playit.stdout.log"
-
-          $stderr = Join-Path `
-            $env:WORKSPACE_DIR `
-            "playit.stderr.log"
-
-          Remove-Item `
-            -LiteralPath $stdout `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          Remove-Item `
-            -LiteralPath $stderr `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          $process = Start-Process `
-            -FilePath $env:PLAYIT_EXE `
-            -ArgumentList @() `
-            -RedirectStandardOutput $stdout `
-            -RedirectStandardError $stderr `
-            -PassThru `
-            -WindowStyle Hidden
-
-          $process.Id |
-            Out-File `
-              -FilePath "$env:RUNNER_TEMP\\playit.pid" `
-              -Encoding ascii
-
-          Start-Sleep -Seconds 5
-
-          if ($process.HasExited) {
-            Write-Host "Playit exited during startup."
-
-            if (Test-Path $stdout) {
-              Get-Content `
-                -LiteralPath $stdout `
-                -Tail 50
-            }
-
-            if (Test-Path $stderr) {
-              Get-Content `
-                -LiteralPath $stderr `
-                -Tail 50
-            }
-
-            throw "Playit agent failed to start."
-          }
-
-          Write-Host "[OK] Playit agent is running."
-
-      - name: Detect Playit claim URL
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $stdout = Join-Path `
-            $env:WORKSPACE_DIR `
-            "playit.stdout.log"
-
-          $stderr = Join-Path `
-            $env:WORKSPACE_DIR `
-            "playit.stderr.log"
-
-          $deadline = (Get-Date).AddSeconds(120)
-
-          $claimUrl = $null
-
-          while ((Get-Date) -lt $deadline) {
-            $text = ""
-
-            if (Test-Path $stdout) {
-              $text += "`n" + (
-                Get-Content `
-                  -LiteralPath $stdout `
-                  -Raw `
-                  -ErrorAction SilentlyContinue
-              )
-            }
-
-            if (Test-Path $stderr) {
-              $text += "`n" + (
-                Get-Content `
-                  -LiteralPath $stderr `
-                  -Raw `
-                  -ErrorAction SilentlyContinue
-              )
-            }
-
-            $match = [regex]::Match(
-              $text,
-              "https?://[^\s`"']+"
-            )
-
-            if ($match.Success) {
-              $claimUrl = $match.Value.TrimEnd(
-                ".",
-                ",",
-                ")",
-                "]"
-              )
-
-              if (
-                $claimUrl -match "(?i)claim|playit"
-              ) {
-                break
-              }
-
-              $claimUrl = $null
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $claimUrl) {
-            Write-Host "Playit output:"
-
-            if (Test-Path $stdout) {
-              Get-Content `
-                -LiteralPath $stdout `
-                -Tail 100
-            }
-
-            if (Test-Path $stderr) {
-              Get-Content `
-                -LiteralPath $stderr `
-                -Tail 100
-            }
-
-            throw "Playit Claim URL was not detected within 2 minutes."
-          }
-
-          "PLAYIT_CLAIM_URL=$claimUrl" |
-            Out-File `
-              -FilePath $env:GITHUB_ENV `
-              -Encoding utf8 `
-              -Append
-
-          Add-Content `
-            -Path $env:GITHUB_STEP_SUMMARY `
-            -Value @"
-          # 🎮 Playit Agent
-
-          ## Claim URL
-
-          $claimUrl
-
-          ## Status
-
-          **Waiting for claim...**
-
-          ## Timeout
-
-          120 seconds.
-
-          "@
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "PLAYIT CLAIM URL"
-          Write-Host "=============================================="
-          Write-Host $claimUrl
-          Write-Host ""
-          Write-Host "Claim the agent within 120 seconds."
-
-      - name: Wait for Playit claim
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $stdout = Join-Path `
-            $env:WORKSPACE_DIR `
-            "playit.stdout.log"
-
-          $stderr = Join-Path `
-            $env:WORKSPACE_DIR `
-            "playit.stderr.log"
-
-          $deadline = (Get-Date).AddSeconds(120)
-
-          $claimed = $false
-
-          while ((Get-Date) -lt $deadline) {
-            $text = ""
-
-            if (Test-Path $stdout) {
-              $text += "`n" + (
-                Get-Content `
-                  -LiteralPath $stdout `
-                  -Raw `
-                  -ErrorAction SilentlyContinue
-              )
-            }
-
-            if (Test-Path $stderr) {
-              $text += "`n" + (
-                Get-Content `
-                  -LiteralPath $stderr `
-                  -Raw `
-                  -ErrorAction SilentlyContinue
-              )
-            }
-
-            if (
-              $text -match "(?i)claimed" -or
-              $text -match "(?i)connected" -or
-              $text -match "(?i)agent.*online"
-            ) {
-              $claimed = $true
-              break
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $claimed) {
-            Write-Host "Playit claim was not detected."
-
-            if (Test-Path $stdout) {
-              Get-Content `
-                -LiteralPath $stdout `
-                -Tail 100
-            }
-
-            if (Test-Path $stderr) {
-              Get-Content `
-                -LiteralPath $stderr `
-                -Tail 100
-            }
-
-            throw "Playit claim was not completed within 2 minutes."
-          }
-
-          Add-Content `
-            -Path $env:GITHUB_STEP_SUMMARY `
-            -Value @"
-          ## Playit
-
-          Status:
-
-          **Claim completed**
-
-          Credentials:
-
-          **Not displayed**
-
-          "@
-
-          Write-Host "[OK] Playit claim completed."
-
-      - name: Install Python
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $python = Get-Command `
-            "py.exe" `
-            -ErrorAction SilentlyContinue
-
-          if (-not $python) {
-            throw "Python launcher was not found."
-          }
-
-          py -3 --version
-
-      - name: Download noVNC
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if (Test-Path -LiteralPath $env:NOVNC_DIR) {
-            Remove-Item `
-              -LiteralPath $env:NOVNC_DIR `
-              -Recurse `
-              -Force
-          }
-
-          git clone `
-            --depth 1 `
-            "https://github.com/novnc/noVNC.git" `
-            $env:NOVNC_DIR
-
-          if (-not (Test-Path -LiteralPath "$env:NOVNC_DIR\\vnc.html")) {
-            throw "noVNC installation failed."
-          }
-
-          py -3 -m pip install `
-            --disable-pip-version-check `
-            --upgrade `
-            websockify
-
-          py -3 -m websockify --help
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "websockify verification failed."
-          }
-
-      - name: Start local noVNC
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $stdout = Join-Path `
-            $env:WORKSPACE_DIR `
-            "novnc.stdout.log"
-
-          $stderr = Join-Path `
-            $env:WORKSPACE_DIR `
-            "novnc.stderr.log"
-
-          $process = Start-Process `
-            -FilePath "py.exe" `
-            -ArgumentList @(
-              "-3",
-              "-m",
-              "websockify",
-              "--web",
-              $env:NOVNC_DIR,
-              "127.0.0.1:$env:NOVNC_PORT",
-              "127.0.0.1:$env:VNC_PORT"
-            ) `
-            -RedirectStandardOutput $stdout `
-            -RedirectStandardError $stderr `
-            -PassThru `
-            -WindowStyle Hidden
-
-          $process.Id |
-            Out-File `
-              -FilePath "$env:RUNNER_TEMP\\novnc.pid" `
-              -Encoding ascii
-
-          Start-Sleep -Seconds 5
-
-          $listener = Get-NetTCPConnection `
-            -LocalAddress "127.0.0.1" `
-            -LocalPort ([int]$env:NOVNC_PORT) `
-            -State Listen `
-            -ErrorAction SilentlyContinue
-
-          if (-not $listener) {
-            if (Test-Path $stderr) {
-              Get-Content `
-                -LiteralPath $stderr `
-                -Tail 100
-            }
-
-            throw "noVNC is not listening on localhost:$env:NOVNC_PORT."
-          }
-
-          Write-Host "[OK] noVNC is listening on 127.0.0.1:$env:NOVNC_PORT."
-
-      - name: Capture desktop screenshot
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Add-Type -AssemblyName System.Drawing
-          Add-Type -AssemblyName System.Windows.Forms
-
-          $output = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            "desktop.png"
-
-          $screens = [System.Windows.Forms.Screen]::AllScreens
-
-          if (-not $screens -or $screens.Count -eq 0) {
-            throw "No Windows display was detected."
-          }
-
-          $left = (
-            $screens |
-            ForEach-Object {
-              $_.Bounds.Left
-            } |
-            Measure-Object -Minimum
-          ).Minimum
-
-          $top = (
-            $screens |
-            ForEach-Object {
-              $_.Bounds.Top
-            } |
-            Measure-Object -Minimum
-          ).Minimum
-
-          $right = (
-            $screens |
-            ForEach-Object {
-              $_.Bounds.Right
-            } |
-            Measure-Object -Maximum
-          ).Maximum
-
-          $bottom = (
-            $screens |
-            ForEach-Object {
-              $_.Bounds.Bottom
-            } |
-            Measure-Object -Maximum
-          ).Maximum
-
-          $width = [int]($right - $left)
-          $height = [int]($bottom - $top)
-
-          if ($width -le 0 -or $height -le 0) {
-            throw "Invalid desktop dimensions."
-          }
-
-          $bitmap = New-Object `
-            System.Drawing.Bitmap(
-              $width,
-              $height,
-              [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
-            )
-
-          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-
-          try {
-            $graphics.CopyFromScreen(
-              $left,
-              $top,
-              0,
-              0,
-              [System.Drawing.Size]::new(
-                $width,
-                $height
-              ),
-              [System.Drawing.CopyPixelOperation]::SourceCopy
-            )
-
-            $bitmap.Save(
-              $output,
-              [System.Drawing.Imaging.ImageFormat]::Png
-            )
-          }
-          finally {
-            $graphics.Dispose()
-            $bitmap.Dispose()
-          }
-
-          if (-not (Test-Path -LiteralPath $output)) {
-            throw "desktop.png was not created."
-          }
-
-          Write-Host "[OK] desktop.png created."
-
-      - name: Upload desktop screenshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: Windows-Desktop-Screenshot
-          path: desktop.png
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Create dashboard
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $connection = Join-Path `
-            $env:WORKSPACE_DIR `
-            "connection.txt"
-
-          $dashboard = @"
-          ==============================================
-                  DAO WINDOWS DESKTOP
-          ==============================================
-
-          OS:
-          Windows Server 2025
-
-          Runner:
-          windows-2025
-
-          Workspace:
-          $env:WORKSPACE_DIR
-
-          ----------------------------------------------
-          Playit
-          ----------------------------------------------
-
-          Status:
-          CLAIMED
-
-          Credentials:
-          Not displayed.
-
-          ----------------------------------------------
-          noVNC
-          ----------------------------------------------
-
-          Status:
-          RUNNING
-
-          Bind:
-          127.0.0.1:$env:NOVNC_PORT
-
-          URL:
-          http://127.0.0.1:$env:NOVNC_PORT/vnc.html
-
-          ----------------------------------------------
-          Desktop Screenshot
-          ----------------------------------------------
-
-          Artifact:
-          Windows-Desktop-Screenshot
-
-          ----------------------------------------------
-          Remote Access
-          ----------------------------------------------
-
-          Public RDP:
-          DISABLED
-
-          Public VNC:
-          DISABLED
-
-          Public noVNC:
-          DISABLED
-
-          AnyDesk unattended access:
-          NOT ENABLED
-
-          ----------------------------------------------
-          Security
-          ----------------------------------------------
-
-          Passwords:
-          NOT DISPLAYED
-
-          GitHub tokens:
-          NOT USED
-
-          Tailscale:
-          NOT USED
-
-          Cloudflare:
-          NOT USED
-
-          ==============================================
-          "@
-
-          Set-Content `
-            -LiteralPath $connection `
-            -Value $dashboard `
-            -Encoding UTF8
-
-          Add-Content `
-            -Path $env:GITHUB_STEP_SUMMARY `
-            -Value @"
-          # 🖥️ Windows Server 2025
-
-          ## System
-
-          **OS:** Windows Server 2025
-
-          **Runner:** `windows-2025`
-
-          ## Applications
-
-          - ✅ Playit Agent
-          - ✅ noVNC
-          - ✅ websockify
-          - ✅ Desktop Screenshot
-
-          ## 🖥️ Desktop Screenshot
-
-          Artifact:
-
-          **Windows-Desktop-Screenshot**
-
-          ## Connection
-
-          noVNC is bound locally to:
-
-          `127.0.0.1:$env:NOVNC_PORT`
-
-          ## 🔐 Security
-
-          Public RDP: **Disabled**
-
-          Public VNC: **Disabled**
-
-          Public noVNC: **Disabled**
-
-          Passwords: **Not displayed**
-
-          "@
-
-          Write-Host $dashboard
-
-      - name: Keep workflow alive
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $end = (Get-Date).AddMinutes(
-            [int]$env:RUNTIME_MINUTES
-          )
-
-          while ((Get-Date) -lt $end) {
-            $playit = Get-Process `
-              -Name "playit" `
-              -ErrorAction SilentlyContinue
-
-            if (-not $playit) {
-              Write-Warning "Playit agent stopped."
-
-              Start-Process `
-                -FilePath $env:PLAYIT_EXE `
-                -ArgumentList @() `
-                -WindowStyle Hidden `
-                -ErrorAction SilentlyContinue
-            }
-
-            $novnc = Get-NetTCPConnection `
-              -LocalAddress "127.0.0.1" `
-              -LocalPort ([int]$env:NOVNC_PORT) `
-              -State Listen `
-              -ErrorAction SilentlyContinue
-
-            if (-not $novnc) {
-              Write-Warning "noVNC stopped."
-            }
-
-            $remaining = $end - (Get-Date)
-
-            Write-Host ""
-            Write-Host "=============================================="
-            Write-Host "DAO WINDOWS DESKTOP"
-            Write-Host "Remaining: $([math]::Floor($remaining.TotalMinutes)) minutes"
-            Write-Host "=============================================="
-
-            Start-Sleep -Seconds 60
-          }
-
-      - name: Cleanup
-        if: always()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          Get-Process `
-            -Name "python" `
-            -ErrorAction SilentlyContinue |
-            Stop-Process `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-          Get-Process `
-            -Name "playit" `
-            -ErrorAction SilentlyContinue |
-            Stop-Process `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-          Remove-Item `
-            -LiteralPath "$env:RUNNER_TEMP\\playit.pid" `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          Remove-Item `
-            -LiteralPath "$env:RUNNER_TEMP\\novnc.pid" `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          Write-Host "[OK] Cleanup completed."
