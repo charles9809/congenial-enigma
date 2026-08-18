@@ -11,13 +11,13 @@ jobs:
     name: Windows Server 2025
     runs-on: windows-2025
 
-    # 5 hours
+    # Maximum requested runtime: 5 hours
     timeout-minutes: 300
 
     steps:
 
       # ============================================================
-      # SYSTEM INFO
+      # SYSTEM INFORMATION
       # ============================================================
 
       - name: System Information
@@ -37,13 +37,20 @@ jobs:
 
           Write-Host ""
           Write-Host "CPU:"
+
           Get-CimInstance Win32_Processor |
             Select-Object -ExpandProperty Name
 
           Write-Host ""
           Write-Host "RAM:"
+
           $ram = Get-CimInstance Win32_ComputerSystem
-          "{0:N2} GB" -f ($ram.TotalPhysicalMemory / 1GB)
+
+          "{0:N2} GB" -f (
+            $ram.TotalPhysicalMemory / 1GB
+          )
+
+          Write-Host ""
 
       # ============================================================
       # TAILSCALE
@@ -53,6 +60,11 @@ jobs:
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          args: "--hostname=amiraliali3"
+
+      # ============================================================
+      # VERIFY TAILSCALE
+      # ============================================================
 
       - name: Verify Tailscale
         shell: powershell
@@ -69,21 +81,80 @@ jobs:
             throw "Tailscale executable not found."
           }
 
-          Write-Host "Tailscale status:"
+          Write-Host "=============================================="
+          Write-Host " Tailscale Status"
+          Write-Host "=============================================="
+
           & $tailscale status
 
           Start-Sleep -Seconds 5
 
-          $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+          # ----------------------------------------------------------
+          # Get Tailscale IPv4
+          # ----------------------------------------------------------
+
+          $ip = (
+            & $tailscale ip -4 |
+            Select-Object -First 1
+          ).Trim()
 
           if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "Could not obtain Tailscale IPv4 address."
+            throw "Could not obtain Tailscale IPv4."
           }
 
+          # ----------------------------------------------------------
+          # Get JSON status
+          # ----------------------------------------------------------
+
+          $jsonText = & $tailscale status --json
+
+          if ([string]::IsNullOrWhiteSpace($jsonText)) {
+            throw "Tailscale JSON status is empty."
+          }
+
+          $status = $jsonText | ConvertFrom-Json
+
+          # ----------------------------------------------------------
+          # Get machine DNS name
+          # ----------------------------------------------------------
+
+          $dnsName = $status.Self.DNSName
+
+          if ([string]::IsNullOrWhiteSpace($dnsName)) {
+
+            Write-Host "DNSName was not returned."
+
+            $dnsName = "amiraliali3"
+
+          } else {
+
+            $dnsName = $dnsName.TrimEnd(".")
+          }
+
+          # ----------------------------------------------------------
+          # Get machine hostname
+          # ----------------------------------------------------------
+
+          $hostname = $status.Self.HostName
+
+          if ([string]::IsNullOrWhiteSpace($hostname)) {
+            $hostname = "amiraliali3"
+          }
+
+          # ----------------------------------------------------------
+          # Save environment variables
+          # ----------------------------------------------------------
+
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+          "TAILSCALE_DOMAIN=$dnsName" >> $env:GITHUB_ENV
 
           Write-Host ""
-          Write-Host "Tailscale connected successfully."
+          Write-Host "Tailscale connection successful."
+          Write-Host "Machine hostname: $hostname"
+
+          # Do NOT print IP or domain yet.
+          # Screenshot must happen first.
 
       # ============================================================
       # FILEZILLA
@@ -101,7 +172,7 @@ jobs:
           $choco = "C:\ProgramData\chocolatey\bin\choco.exe"
 
           if (!(Test-Path $choco)) {
-            throw "Chocolatey is not installed on this Windows runner."
+            throw "Chocolatey is not installed."
           }
 
           & $choco install filezilla `
@@ -113,7 +184,7 @@ jobs:
           Write-Host "Chocolatey exit code: $exitCode"
 
           if ($exitCode -ne 0) {
-            throw "FileZilla installation failed. Chocolatey exit code: $exitCode"
+            throw "FileZilla installation failed. Exit code: $exitCode"
           }
 
           Write-Host "FileZilla installation completed."
@@ -132,33 +203,36 @@ jobs:
             "${env:ProgramFiles(x86)}\FileZilla FTP Client\filezilla.exe"
           )
 
-          $found = $false
+          $foundPath = $null
 
           foreach ($path in $paths) {
+
             if (Test-Path $path) {
-              Write-Host "FileZilla found:"
-              Write-Host $path
-              $found = $true
+              $foundPath = $path
               break
             }
           }
 
-          if (!$found) {
+          if ($null -eq $foundPath) {
 
-            $found = Get-ChildItem `
+            $file = Get-ChildItem `
               "$env:ProgramFiles" `
               -Filter "filezilla.exe" `
               -Recurse `
               -ErrorAction SilentlyContinue |
               Select-Object -First 1
 
+            if ($file) {
+              $foundPath = $file.FullName
+            }
           }
 
-          if (!$found) {
-            throw "FileZilla executable was not found after installation."
+          if ($null -eq $foundPath) {
+            throw "FileZilla executable was not found."
           }
 
-          Write-Host "FileZilla verification successful."
+          Write-Host "FileZilla verified:"
+          Write-Host $foundPath
 
       # ============================================================
       # NOTEPAD++
@@ -173,17 +247,16 @@ jobs:
           Write-Host " Installing Notepad++"
           Write-Host "=============================================="
 
-          # Current verified x64 release
           $version = "8.9.7"
 
-          $url = "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v$version/npp.$version.Installer.x64.exe"
+          $url = `
+            "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v$version/npp.$version.Installer.x64.exe"
 
           $installer = Join-Path `
             $env:TEMP `
             "NotepadPlusPlus-$version-x64.exe"
 
-          Write-Host "Downloading:"
-          Write-Host $url
+          Write-Host "Downloading Notepad++..."
 
           Invoke-WebRequest `
             -Uri $url `
@@ -191,16 +264,21 @@ jobs:
             -UseBasicParsing
 
           if (!(Test-Path $installer)) {
-            throw "Notepad++ installer was not downloaded."
+            throw "Notepad++ installer download failed."
           }
 
-          Write-Host "Installer downloaded."
+          Write-Host "Installing Notepad++..."
 
-          Start-Process `
+          $process = Start-Process `
             -FilePath $installer `
             -ArgumentList "/S" `
             -Wait `
+            -PassThru `
             -NoNewWindow
+
+          if ($process.ExitCode -ne 0) {
+            throw "Notepad++ installer failed. Exit code: $($process.ExitCode)"
+          }
 
           Remove-Item `
             $installer `
@@ -223,26 +301,87 @@ jobs:
             "${env:ProgramFiles(x86)}\Notepad++\notepad++.exe"
           )
 
-          $found = $false
+          $foundPath = $null
 
           foreach ($path in $paths) {
 
             if (Test-Path $path) {
-
-              Write-Host "Notepad++ found:"
-              Write-Host $path
-
-              $found = $true
-
+              $foundPath = $path
               break
             }
           }
 
-          if (!$found) {
+          if ($null -eq $foundPath) {
             throw "Notepad++ executable was not found."
           }
 
-          Write-Host "Notepad++ verification successful."
+          Write-Host "Notepad++ verified:"
+          Write-Host $foundPath
+
+      # ============================================================
+      # DISABLE PASSWORD COMPLEXITY
+      #
+      # Required because the requested password:
+      #
+      # aaasssaa1345
+      #
+      # does not contain uppercase/special characters.
+      # ============================================================
+
+      - name: Configure Local Password Policy
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Configuring local password policy..."
+
+          $cfg = Join-Path `
+            $env:TEMP `
+            "local-security.cfg"
+
+          $db = Join-Path `
+            $env:TEMP `
+            "local-security.sdb"
+
+          secedit /export `
+            /cfg $cfg `
+            /quiet
+
+          if (!(Test-Path $cfg)) {
+            throw "Could not export local security policy."
+          }
+
+          $content = Get-Content `
+            $cfg `
+            -Raw
+
+          if ($content -match "PasswordComplexity") {
+
+            $content = $content -replace `
+              "PasswordComplexity\s*=\s*\d+", `
+              "PasswordComplexity = 0"
+
+          } else {
+
+            $content += "`r`nPasswordComplexity = 0`r`n"
+          }
+
+          Set-Content `
+            -Path $cfg `
+            -Value $content `
+            -Encoding Unicode
+
+          secedit /configure `
+            /db $db `
+            /cfg $cfg `
+            /areas SECURITYPOLICY `
+            /quiet
+
+          gpupdate /force | Out-Null
+
+          Start-Sleep -Seconds 3
+
+          Write-Host "Local password complexity policy configured."
 
       # ============================================================
       # ENABLE RDP
@@ -274,8 +413,21 @@ jobs:
             -Name TermService `
             -StartupType Automatic
 
-          if ((Get-Service TermService).Status -ne "Running") {
-            Start-Service TermService
+          $service = Get-Service `
+            -Name TermService
+
+          if ($service.Status -ne "Running") {
+            Start-Service `
+              -Name TermService
+          }
+
+          Start-Sleep -Seconds 3
+
+          $service = Get-Service `
+            -Name TermService
+
+          if ($service.Status -ne "Running") {
+            throw "Remote Desktop service failed to start."
           }
 
           Write-Host "RDP enabled successfully."
@@ -289,14 +441,16 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $username = "remoteuser"
+          $username = "amiraliali3"
 
-          if ([string]::IsNullOrWhiteSpace("${{ secrets.RDP_PASSWORD }}")) {
-            throw "RDP_PASSWORD secret is missing."
-          }
+          $plainPassword = "aaasssaa1345"
 
-          $password = ConvertTo-SecureString `
-            "${{ secrets.RDP_PASSWORD }}" `
+          Write-Host "=============================================="
+          Write-Host " Creating RDP User"
+          Write-Host "=============================================="
+
+          $securePassword = ConvertTo-SecureString `
+            $plainPassword `
             -AsPlainText `
             -Force
 
@@ -308,10 +462,11 @@ jobs:
 
             New-LocalUser `
               -Name $username `
-              -Password $password `
-              -FullName "Temporary Remote User" `
-              -Description "Temporary GitHub Actions RDP account" `
-              -PasswordNeverExpires
+              -Password $securePassword `
+              -FullName "amiraliali3" `
+              -Description "Temporary GitHub Actions RDP user" `
+              -PasswordNeverExpires:$true `
+              -AccountNeverExpires:$true
 
             Write-Host "RDP user created."
 
@@ -319,31 +474,92 @@ jobs:
 
             Set-LocalUser `
               -Name $username `
-              -Password $password
+              -Password $securePassword
 
-            Write-Host "RDP user already existed. Password updated."
+            Write-Host "Existing RDP user password updated."
           }
 
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $username `
+          # ----------------------------------------------------------
+          # Add to Remote Desktop Users
+          # ----------------------------------------------------------
+
+          $group = Get-LocalGroup `
+            -Name "Remote Desktop Users" `
+            -ErrorAction Stop
+
+          $member = Get-LocalGroupMember `
+            -Group $group.Name `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -match "\\$([regex]::Escape($username))$"
+            }
+
+          if ($null -eq $member) {
+
+            Add-LocalGroupMember `
+              -Group $group.Name `
+              -Member $username
+
+          }
+
+          # ----------------------------------------------------------
+          # Verify
+          # ----------------------------------------------------------
+
+          $userCheck = Get-LocalUser `
+            -Name $username `
             -ErrorAction SilentlyContinue
 
-          Write-Host "RDP user configured."
+          if ($null -eq $userCheck) {
+            throw "RDP user was not created."
+          }
+
+          Write-Output "::add-mask::$plainPassword"
+
+          "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+
+          Write-Host "RDP user configured successfully."
 
       # ============================================================
-      # WAIT
+      # RDP SERVICE VERIFICATION
+      # ============================================================
+
+      - name: Verify RDP Port
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Checking RDP port 3389..."
+
+          Start-Sleep -Seconds 3
+
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $listener) {
+            throw "RDP is not listening on TCP port 3389."
+          }
+
+          Write-Host "RDP port 3389 is listening."
+
+      # ============================================================
+      # PREPARE DESKTOP
       # ============================================================
 
       - name: Prepare Desktop
         shell: powershell
         run: |
-          Write-Host "Waiting for Windows desktop..."
+          Write-Host "Preparing Windows desktop..."
 
           Start-Sleep -Seconds 20
 
       # ============================================================
-      # SCREENSHOT BEFORE IP DISPLAY
+      # SCREENSHOT
+      #
+      # IMPORTANT:
+      # No Tailscale IP or domain is printed before this step.
       # ============================================================
 
       - name: Capture Desktop Screenshot
@@ -352,7 +568,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           Write-Host "=============================================="
-          Write-Host " Capturing Desktop"
+          Write-Host " Capturing Desktop Screenshot"
           Write-Host "=============================================="
 
           Add-Type -AssemblyName System.Windows.Forms
@@ -366,32 +582,42 @@ jobs:
 
           $left = (
             $screens |
-            ForEach-Object { $_.Bounds.Left } |
+            ForEach-Object {
+              $_.Bounds.Left
+            } |
             Measure-Object -Minimum
           ).Minimum
 
           $top = (
             $screens |
-            ForEach-Object { $_.Bounds.Top } |
+            ForEach-Object {
+              $_.Bounds.Top
+            } |
             Measure-Object -Minimum
           ).Minimum
 
           $right = (
             $screens |
-            ForEach-Object { $_.Bounds.Right } |
+            ForEach-Object {
+              $_.Bounds.Right
+            } |
             Measure-Object -Maximum
           ).Maximum
 
           $bottom = (
             $screens |
-            ForEach-Object { $_.Bounds.Bottom } |
+            ForEach-Object {
+              $_.Bounds.Bottom
+            } |
             Measure-Object -Maximum
           ).Maximum
 
           $width = $right - $left
           $height = $bottom - $top
 
-          Write-Host "Resolution: ${width}x${height}"
+          Write-Host "Desktop:"
+          Write-Host "Width:  $width"
+          Write-Host "Height: $height"
 
           $bitmap = New-Object `
             System.Drawing.Bitmap `
@@ -401,33 +627,40 @@ jobs:
           $graphics = `
             [System.Drawing.Graphics]::FromImage($bitmap)
 
-          $graphics.CopyFromScreen(
-            $left,
-            $top,
-            0,
-            0,
-            $bitmap.Size
-          )
+          try {
 
-          $screenshot = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            "desktop-before-ip.png"
+            $graphics.CopyFromScreen(
+              $left,
+              $top,
+              0,
+              0,
+              $bitmap.Size
+            )
 
-          $bitmap.Save(
-            $screenshot,
-            [System.Drawing.Imaging.ImageFormat]::Png
-          )
+            $screenshot = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "desktop-before-ip.png"
 
-          $graphics.Dispose()
-          $bitmap.Dispose()
+            $bitmap.Save(
+              $screenshot,
+              [System.Drawing.Imaging.ImageFormat]::Png
+            )
+
+          }
+          finally {
+
+            $graphics.Dispose()
+            $bitmap.Dispose()
+
+          }
 
           if (!(Test-Path $screenshot)) {
-            throw "Screenshot creation failed."
+            throw "Screenshot was not created."
           }
 
           Write-Host ""
-          Write-Host "Screenshot successfully created:"
-          Write-Host $screenshot
+          Write-Host "Screenshot created successfully."
+          Write-Host "File: $screenshot"
 
       # ============================================================
       # UPLOAD SCREENSHOT
@@ -442,77 +675,97 @@ jobs:
           retention-days: 1
 
       # ============================================================
-      # GITHUB SUMMARY
+      # CREATE GITHUB SUMMARY
       # ============================================================
 
       - name: Create GitHub Actions Summary
         shell: powershell
         env:
           TAILSCALE_IP: ${{ env.TAILSCALE_IP }}
+          TAILSCALE_HOSTNAME: ${{ env.TAILSCALE_HOSTNAME }}
+          TAILSCALE_DOMAIN: ${{ env.TAILSCALE_DOMAIN }}
           RUN_ID: ${{ github.run_id }}
-          SERVER_NAME: ${{ github.repository }}
         run: |
-          $summary = @"
-          # 🖥️ Windows Server 2025
 
-          ## 🟢 Server Status
+          $summary = @"
+          # 🖥️ Windows Server 2025 Remote
+
+          ## 🟢 Status
 
           | Component | Status |
           |---|---|
-          | Operating System | 🟢 Windows Server 2025 |
+          | Windows Server 2025 | 🟢 Online |
           | Tailscale | 🟢 Connected |
           | FileZilla | 🟢 Installed |
           | Notepad++ | 🟢 Installed |
-          | Remote Desktop | 🟢 Enabled |
+          | RDP | 🟢 Enabled |
           | Runtime | ⏱️ 5 Hours |
 
           ## 📸 Desktop Screenshot
 
-          Screenshot was captured **before the Tailscale IP was displayed**.
+          The screenshot was captured **before the IP and domain information was displayed**.
 
-          **[📥 Open Screenshot Artifact](../../actions/runs/$env:RUN_ID)**
-
-          Artifact name:
+          **Artifact:**
 
           `windows-2025-desktop-screenshot`
 
-          ## 🔐 RDP
+          [📥 Open Screenshot Artifact](../../actions/runs/$env:RUN_ID)
 
-          ### Tailscale IPv4
+          ## 🌐 Tailscale
+
+          ### IPv4
 
           ```
           $env:TAILSCALE_IP
           ```
 
-          ### RDP Address
+          ### Machine Name
+
+          ```
+          $env:TAILSCALE_HOSTNAME
+          ```
+
+          ### MagicDNS Domain
+
+          ```
+          $env:TAILSCALE_DOMAIN
+          ```
+
+          ## 🖥️ RDP
+
+          ### Address
 
           ```
           $env:TAILSCALE_IP`:3389
           ```
 
+          ### Domain
+
+          ```
+          $env:TAILSCALE_DOMAIN`:3389
+          ```
+
           ### Username
 
           ```
-          remoteuser
+          amiraliali3
           ```
 
           ### Password
 
-          The password is stored in:
-
           ```
-          RDP_PASSWORD
+          aaasssaa1345
           ```
 
           ## ⏱️ Runtime
 
-          The runner will remain active for approximately **5 hours**.
+          The Windows runner will remain online for approximately **5 hours**.
 
           ## ⚠️ Important
 
-          This is a temporary GitHub-hosted runner.
+          This is a temporary GitHub-hosted Windows Server 2025 runner.
 
-          When the workflow ends, GitHub destroys the VM.
+          When the workflow ends, GitHub destroys the virtual machine.
 
           "@
 
@@ -522,16 +775,29 @@ jobs:
               -Encoding utf8
 
       # ============================================================
-      # DISPLAY IP
+      # SHOW IP + DOMAIN
+      #
+      # THIS IS INTENTIONALLY AFTER SCREENSHOT.
       # ============================================================
 
       - name: Show Remote Connection Information
         shell: powershell
         run: |
+
           Write-Host ""
-          Write-Host "===================================================="
-          Write-Host "        WINDOWS SERVER 2025 REMOTE ACCESS"
-          Write-Host "===================================================="
+          Write-Host "======================================================"
+          Write-Host "       WINDOWS SERVER 2025 REMOTE ACCESS"
+          Write-Host "======================================================"
+          Write-Host ""
+
+          Write-Host "Username:"
+          Write-Host "amiraliali3"
+
+          Write-Host ""
+
+          Write-Host "Password:"
+          Write-Host "aaasssaa1345"
+
           Write-Host ""
 
           Write-Host "Tailscale IPv4:"
@@ -539,30 +805,36 @@ jobs:
 
           Write-Host ""
 
-          Write-Host "RDP Address:"
+          Write-Host "Tailscale Hostname:"
+          Write-Host $env:TAILSCALE_HOSTNAME
+
+          Write-Host ""
+
+          Write-Host "Tailscale MagicDNS:"
+          Write-Host $env:TAILSCALE_DOMAIN
+
+          Write-Host ""
+
+          Write-Host "RDP IP:"
           Write-Host "$($env:TAILSCALE_IP):3389"
 
           Write-Host ""
 
-          Write-Host "Username:"
-          Write-Host "remoteuser"
+          Write-Host "RDP Domain:"
+          Write-Host "$($env:TAILSCALE_DOMAIN):3389"
 
           Write-Host ""
 
-          Write-Host "Password:"
-          Write-Host "Use GitHub Secret: RDP_PASSWORD"
-
-          Write-Host ""
-
-          Write-Host "===================================================="
+          Write-Host "======================================================"
 
       # ============================================================
-      # KEEP ALIVE 5 HOURS
+      # KEEP SERVER ONLINE FOR 5 HOURS
       # ============================================================
 
       - name: Keep Server Online For 5 Hours
         shell: powershell
         run: |
+
           $ErrorActionPreference = "Stop"
 
           $totalSeconds = 5 * 60 * 60
@@ -588,7 +860,8 @@ jobs:
                 ($remaining % 3600) / 60
               )
 
-              Write-Host "Remaining: ${hours}h ${minutes}m"
+              Write-Host `
+                "Remaining: ${hours}h ${minutes}m"
             }
 
             Start-Sleep -Seconds 1
@@ -605,7 +878,10 @@ jobs:
         if: always()
         shell: powershell
         run: |
-          Write-Host "Cleaning up Tailscale..."
+
+          Write-Host "=============================================="
+          Write-Host " Cleaning up Tailscale"
+          Write-Host "=============================================="
 
           $tailscale = "${env:ProgramFiles}\Tailscale\tailscale.exe"
 
@@ -614,11 +890,22 @@ jobs:
           }
 
           if (Test-Path $tailscale) {
+
             try {
+
               & $tailscale logout
+
               Write-Host "Tailscale logout completed."
+
             }
             catch {
+
               Write-Host "Tailscale cleanup completed."
+
             }
+
+          } else {
+
+            Write-Host "Tailscale executable not found during cleanup."
+
           }
