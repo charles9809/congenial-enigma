@@ -565,102 +565,184 @@ jobs:
       # ==========================================================
 
       - name: "📸 Capture Desktop Screenshot"
+        shell: pwsh
         run: |
-
           $ErrorActionPreference = "Stop"
 
-          Add-Type `
-            -AssemblyName System.Windows.Forms
+          Write-Host "=============================================="
+          Write-Host "        CAPTURING DESKTOP SCREENSHOT"
+          Write-Host "=============================================="
 
-          Add-Type `
-            -AssemblyName System.Drawing
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
 
-          $screens = `
-            [System.Windows.Forms.Screen]::AllScreens
+          $screens = [System.Windows.Forms.Screen]::AllScreens
 
           if ($null -eq $screens -or $screens.Count -eq 0) {
-            throw "No display was detected."
+              throw "No display was detected."
           }
 
-          $left = (
-            $screens |
-            ForEach-Object {
-              $_.Bounds.Left
-            } |
-            Measure-Object -Minimum
-          ).Minimum
+          Write-Host "Detected displays: $($screens.Count)"
 
-          $top = (
-            $screens |
-            ForEach-Object {
-              $_.Bounds.Top
-            } |
-            Measure-Object -Minimum
-          ).Minimum
+          # -------------------------------------------------------
+          # Calculate complete virtual desktop bounds
+          # -------------------------------------------------------
 
-          $right = (
-            $screens |
-            ForEach-Object {
-              $_.Bounds.Right
-            } |
-            Measure-Object -Maximum
-          ).Maximum
+          $left   = ($screens | ForEach-Object { $_.Bounds.Left   } | Measure-Object -Minimum).Minimum
+          $top    = ($screens | ForEach-Object { $_.Bounds.Top    } | Measure-Object -Minimum).Minimum
+          $right  = ($screens | ForEach-Object { $_.Bounds.Right  } | Measure-Object -Maximum).Maximum
+          $bottom = ($screens | ForEach-Object { $_.Bounds.Bottom } | Measure-Object -Maximum).Maximum
 
-          $bottom = (
-            $screens |
-            ForEach-Object {
-              $_.Bounds.Bottom
-            } |
-            Measure-Object -Maximum
-          ).Maximum
+          [int]$width  = $right - $left
+          [int]$height = $bottom - $top
 
-          $width = $right - $left
-          $height = $bottom - $top
+          Write-Host "Desktop bounds:"
+          Write-Host "Left   : $left"
+          Write-Host "Top    : $top"
+          Write-Host "Right  : $right"
+          Write-Host "Bottom : $bottom"
+          Write-Host "Size   : ${width}x${height}"
 
-          Write-Host "Desktop size: ${width}x${height}"
+          if ($width -le 0 -or $height -le 0) {
+              throw "Invalid desktop dimensions: ${width}x${height}"
+          }
+
+          # -------------------------------------------------------
+          # Screenshot output
+          # -------------------------------------------------------
 
           $file = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            "desktop-screenshot.png"
+              $env:GITHUB_WORKSPACE `
+              "desktop-screenshot.png"
 
-          $bitmap = New-Object `
-            System.Drawing.Bitmap `
-            $width,
-            $height
+          if (Test-Path $file) {
+              Remove-Item $file -Force
+          }
 
-          $graphics = `
-            [System.Drawing.Graphics]::FromImage($bitmap)
+          # -------------------------------------------------------
+          # IMPORTANT:
+          # Use explicit Int32 constructor instead of New-Object.
+          # -------------------------------------------------------
+
+          $bitmap = New-Object System.Drawing.Bitmap(
+              [int]$width,
+              [int]$height,
+              [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+          )
+
+          $graphics = $null
 
           try {
 
-            $graphics.CopyFromScreen(
-              $left,
-              $top,
-              0,
-              0,
-              $bitmap.Size
-            )
+              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 
-            $bitmap.Save(
-              $file,
-              [System.Drawing.Imaging.ImageFormat]::Png
-            )
+              if ($null -eq $graphics) {
+                  throw "Could not create Graphics object."
+              }
+
+              # Improve screenshot quality.
+              $graphics.CompositingQuality =
+                  [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+
+              $graphics.InterpolationMode =
+                  [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+
+              $graphics.SmoothingMode =
+                  [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+
+              $graphics.PixelOffsetMode =
+                  [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+
+              # Clear bitmap before capture.
+              $graphics.Clear(
+                  [System.Drawing.Color]::Black
+              )
+
+              # ---------------------------------------------------
+              # Capture entire virtual desktop
+              # ---------------------------------------------------
+
+              $graphics.CopyFromScreen(
+                  [int]$left,
+                  [int]$top,
+                  0,
+                  0,
+                  [System.Drawing.Size]::new(
+                      [int]$width,
+                      [int]$height
+                  ),
+                  [System.Drawing.CopyPixelOperation]::SourceCopy
+              )
+
+              # ---------------------------------------------------
+              # Save PNG
+              # ---------------------------------------------------
+
+              $bitmap.Save(
+                  $file,
+                  [System.Drawing.Imaging.ImageFormat]::Png
+              )
 
           }
           finally {
 
-            $graphics.Dispose()
+              if ($null -ne $graphics) {
+                  $graphics.Dispose()
+              }
 
-            $bitmap.Dispose()
+              if ($null -ne $bitmap) {
+                  $bitmap.Dispose()
+              }
           }
+
+          # -------------------------------------------------------
+          # Verify screenshot
+          # -------------------------------------------------------
 
           if (!(Test-Path $file)) {
-            throw "Desktop screenshot was not created."
+              throw "Screenshot file was not created."
           }
 
-          Write-Host "Screenshot created successfully."
+          $info = Get-Item $file
 
-      # ==========================================================
+          if ($info.Length -le 0) {
+              throw "Screenshot file is empty."
+          }
+
+          Write-Host ""
+          Write-Host "Screenshot successfully created."
+          Write-Host "File: $file"
+          Write-Host "Size: $([math]::Round($info.Length / 1KB, 2)) KB"
+
+          # -------------------------------------------------------
+          # Verify image can actually be opened
+          # -------------------------------------------------------
+
+          $testImage = $null
+
+          try {
+
+              $testImage = [System.Drawing.Image]::FromFile($file)
+
+              Write-Host "Image verification successful."
+              Write-Host "Image dimensions: $($testImage.Width)x$($testImage.Height)"
+
+          }
+          catch {
+
+              throw "Screenshot was created but is not a valid image: $($_.Exception.Message)"
+
+          }
+          finally {
+
+              if ($null -ne $testImage) {
+                  $testImage.Dispose()
+              }
+          }
+
+          Write-Host "=============================================="
+          Write-Host "        SCREENSHOT COMPLETE"
+          Write-Host "=============================================="      # ==========================================================
       # 14. UPLOAD SCREENSHOT
       # ==========================================================
 
