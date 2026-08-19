@@ -1,4 +1,4 @@
-name: RDP + Avica
+name: Avica Remote Windows
 
 on:
   workflow_dispatch:
@@ -7,37 +7,39 @@ permissions:
   contents: read
 
 jobs:
-  secure-rdp:
+  avica-remote:
+    name: Windows Avica Remote
     runs-on: windows-latest
     timeout-minutes: 320
+
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
 
       # =========================================================
-      # 1. ENABLE RDP
+      # 1. Configure Windows RDP
       # =========================================================
-      - name: Enable RDP
-        shell: pwsh
+      - name: Configure Windows RDP
         run: |
-          Write-Host "========================================"
-          Write-Host "Enabling Windows Remote Desktop"
-          Write-Host "========================================"
+          Write-Host "Configuring Windows Remote Desktop..."
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" `
+            -Name 'fDenyTSConnections' `
             -Value 0 `
             -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" `
+            -Name 'UserAuthentication' `
             -Value 0 `
             -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" `
+            -Name 'SecurityLayer' `
             -Value 0 `
             -Force
 
@@ -50,51 +52,30 @@ jobs:
             protocol=TCP `
             localport=3389
 
+          Set-Service -Name TermService -StartupType Automatic
+
           Restart-Service -Name TermService -Force
 
-          Write-Host ""
-          Write-Host "RDP successfully enabled."
-          Write-Host ""
+          Write-Host "RDP configuration completed."
 
       # =========================================================
-      # 2. CREATE RDP USER
+      # 2. Create RDP User
       # =========================================================
       - name: Create RDP User
-        shell: pwsh
         run: |
-          Write-Host "========================================"
-          Write-Host "Creating RDP User"
-          Write-Host "========================================"
+          Write-Host "Creating RDP user..."
 
           $upper = [char[]](65..90)
           $lower = [char[]](97..122)
           $numbers = [char[]](48..57)
-
-          # Use shell-safe special characters
-          $special = @(
-              '!',
-              '@',
-              '#',
-              '$',
-              '%',
-              '^',
-              '&',
-              '*'
-          )
+          $special = [char[]](33..47)
 
           $passwordChars = @()
 
-          $passwordChars += $upper |
-              Get-Random -Count 4
-
-          $passwordChars += $lower |
-              Get-Random -Count 4
-
-          $passwordChars += $numbers |
-              Get-Random -Count 4
-
-          $passwordChars += $special |
-              Get-Random -Count 4
+          $passwordChars += $upper | Get-Random -Count 4
+          $passwordChars += $lower | Get-Random -Count 4
+          $passwordChars += $numbers | Get-Random -Count 4
+          $passwordChars += $special | Get-Random -Count 4
 
           $password = -join (
               $passwordChars |
@@ -102,339 +83,387 @@ jobs:
           )
 
           $securePassword = ConvertTo-SecureString `
-            $password `
-            -AsPlainText `
-            -Force
+              $password `
+              -AsPlainText `
+              -Force
 
-          # Remove old RDP user if it exists
           $existingUser = Get-LocalUser `
-            -Name "RDP" `
-            -ErrorAction SilentlyContinue
+              -Name "RDP" `
+              -ErrorAction SilentlyContinue
 
           if ($existingUser) {
-              Write-Host "Existing RDP user found. Removing it..."
-
-              Remove-LocalUser `
-                -Name "RDP"
+              Write-Host "Removing existing RDP user..."
+              Remove-LocalUser -Name "RDP"
           }
 
-          # Create user
           New-LocalUser `
-            -Name "RDP" `
-            -Password $securePassword `
-            -AccountNeverExpires `
-            -PasswordNeverExpires `
-            -Description "Remote Desktop User"
+              -Name "RDP" `
+              -Password $securePassword `
+              -AccountNeverExpires `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword
 
-          # Add to Administrators
           Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member "RDP"
+              -Group "Administrators" `
+              -Member "RDP"
 
-          # Add to Remote Desktop Users
           Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "RDP"
+              -Group "Remote Desktop Users" `
+              -Member "RDP"
 
-          # Verify
-          $userCheck = Get-LocalUser `
-            -Name "RDP" `
-            -ErrorAction SilentlyContinue
+          $verify = Get-LocalUser `
+              -Name "RDP" `
+              -ErrorAction SilentlyContinue
 
-          if (!$userCheck) {
-              Write-Error "Failed to create RDP user."
-              exit 1
+          if (!$verify) {
+              throw "Failed to create RDP user."
           }
 
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "RDP USER CREATED"
-          Write-Host "========================================"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $password"
-          Write-Host "========================================"
-          Write-Host ""
+          Write-Host "RDP user created successfully."
+
+          # Store only for this workflow.
+          "RDP_USERNAME=RDP" | Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append
+
+          "RDP_PASSWORD=$password" | Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append
 
       # =========================================================
-      # 3. DOWNLOAD AVICA
+      # 3. Download Avica
       # =========================================================
       - name: Download Avica
-        shell: pwsh
         run: |
-          Write-Host "========================================"
-          Write-Host "Downloading Avica"
-          Write-Host "========================================"
-
           $avicaUrl = "https://download.avica.com/downloader/Avica_setup.exe"
+          $installer = "$env:TEMP\Avica_setup.exe"
 
-          $installerPath = "$env:TEMP\Avica_setup.exe"
-
-          Write-Host "URL:"
+          Write-Host "Downloading Avica..."
           Write-Host $avicaUrl
-          Write-Host ""
 
           Invoke-WebRequest `
-            -Uri $avicaUrl `
-            -OutFile $installerPath `
-            -UseBasicParsing
+              -Uri $avicaUrl `
+              -OutFile $installer `
+              -UseBasicParsing
 
-          if (!(Test-Path $installerPath)) {
-              Write-Error "Avica installer was not downloaded."
-              exit 1
+          if (!(Test-Path $installer)) {
+              throw "Avica installer was not downloaded."
           }
 
-          $fileInfo = Get-Item $installerPath
+          $fileInfo = Get-Item $installer
 
-          Write-Host "Download completed."
-          Write-Host "File: $($fileInfo.FullName)"
+          Write-Host "Installer:"
+          Write-Host $fileInfo.FullName
           Write-Host "Size: $($fileInfo.Length) bytes"
 
           if ($fileInfo.Length -lt 100000) {
-              Write-Error "Downloaded file appears to be invalid."
-              exit 1
+              throw "Avica installer appears to be invalid or incomplete."
           }
 
-          # Make installer available to next step
-          echo "AVICA_INSTALLER=$installerPath" >> $env:GITHUB_ENV
-
-          Write-Host ""
-          Write-Host "Avica download successful."
+          "AVICA_INSTALLER=$installer" | Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append
 
       # =========================================================
-      # 4. INSTALL AVICA + START + WAIT EXACTLY 2 MINUTES
+      # 4. Install Avica
       # =========================================================
-      - name: Install Avica and Wait 2 Minutes
-        shell: pwsh
+      - name: Install Avica
         run: |
-          Write-Host "========================================"
-          Write-Host "Installing Avica"
-          Write-Host "========================================"
+          Write-Host "Installing Avica..."
 
-          if (!(Test-Path "$env:AVICA_INSTALLER")) {
-              Write-Error "Avica installer not found."
-              exit 1
-          }
+          $installer = $env:AVICA_INSTALLER
 
-          # Start installer
-          $installerProcess = Start-Process `
-            -FilePath "$env:AVICA_INSTALLER" `
-            -ArgumentList "/S" `
-            -Wait `
-            -PassThru
+          # Try silent installation first.
+          $process = Start-Process `
+              -FilePath $installer `
+              -ArgumentList "/S" `
+              -Wait `
+              -PassThru
 
-          Write-Host ""
-          Write-Host "Installer exit code: $($installerProcess.ExitCode)"
-          Write-Host ""
+          Write-Host "Installer exit code: $($process.ExitCode)"
 
-          if ($installerProcess.ExitCode -ne 0) {
-              Write-Warning `
-                "Avica installer returned exit code $($installerProcess.ExitCode)."
-          }
+          Start-Sleep -Seconds 10
 
           Write-Host "Searching for Avica.exe..."
 
-          $possiblePaths = @(
-              "$env:ProgramFiles\Avica\Avica.exe",
-              "${env:ProgramFiles(x86)}\Avica\Avica.exe",
-              "$env:LOCALAPPDATA\Avica\Avica.exe",
-              "$env:ProgramFiles\Avica Remote Desktop\Avica.exe",
-              "${env:ProgramFiles(x86)}\Avica Remote Desktop\Avica.exe"
+          $searchPaths = @(
+              "$env:ProgramFiles\Avica",
+              "${env:ProgramFiles(x86)}\Avica",
+              "$env:LOCALAPPDATA\Avica",
+              "$env:ProgramFiles\Avica Remote Desktop",
+              "${env:ProgramFiles(x86)}\Avica Remote Desktop",
+              "$env:LOCALAPPDATA\Programs\Avica"
           )
 
           $avicaExe = $null
 
-          foreach ($path in $possiblePaths) {
+          foreach ($basePath in $searchPaths) {
 
-              if (Test-Path $path) {
-                  $avicaExe = $path
-                  break
-              }
-          }
+              if (Test-Path $basePath) {
 
-          # If not found, search installation directories
-          if (!$avicaExe) {
+                  Write-Host "Searching: $basePath"
 
-              Write-Host "Avica.exe not found in standard paths."
-              Write-Host "Searching installation directories..."
+                  $result = Get-ChildItem `
+                      -Path $basePath `
+                      -Filter "Avica.exe" `
+                      -Recurse `
+                      -File `
+                      -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
 
-              $searchPaths = @(
-                  "$env:ProgramFiles",
-                  "${env:ProgramFiles(x86)}",
-                  "$env:LOCALAPPDATA"
-              )
-
-              foreach ($searchPath in $searchPaths) {
-
-                  if (!(Test-Path $searchPath)) {
-                      continue
-                  }
-
-                  $found = Get-ChildItem `
-                    -Path $searchPath `
-                    -Filter "Avica.exe" `
-                    -Recurse `
-                    -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-
-                  if ($found) {
-                      $avicaExe = $found.FullName
+                  if ($result) {
+                      $avicaExe = $result.FullName
                       break
                   }
               }
           }
 
+          # Fallback: search common locations.
           if (!$avicaExe) {
-              Write-Error "Avica.exe could not be found after installation."
-              exit 1
+
+              Write-Host "Avica.exe was not found in common paths."
+              Write-Host "Running broader search..."
+
+              $result = Get-ChildItem `
+                  -Path "$env:ProgramFiles",
+                        "${env:ProgramFiles(x86)}",
+                        "$env:LOCALAPPDATA" `
+                  -Filter "Avica.exe" `
+                  -Recurse `
+                  -File `
+                  -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+
+              if ($result) {
+                  $avicaExe = $result.FullName
+              }
+          }
+
+          if (!$avicaExe) {
+              throw "Avica.exe was not found after installation."
           }
 
           Write-Host ""
+          Write-Host "=========================================="
           Write-Host "Avica executable found:"
           Write-Host $avicaExe
+          Write-Host "=========================================="
           Write-Host ""
 
-          echo "AVICA_EXE=$avicaExe" >> $env:GITHUB_ENV
+          "AVICA_EXE=$avicaExe" | Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append
 
-          # -----------------------------------------------------
-          # Start Avica
-          # -----------------------------------------------------
+      # =========================================================
+      # 5. Start Avica
+      # =========================================================
+      - name: Start Avica
+        run: |
           Write-Host "Starting Avica..."
 
-          Start-Process `
-            -FilePath $avicaExe
+          $avica = Start-Process `
+              -FilePath "$env:AVICA_EXE" `
+              -PassThru
 
-          Write-Host "Avica process started."
+          Start-Sleep -Seconds 15
 
-          # -----------------------------------------------------
-          # EXACTLY 120 SECONDS
-          # -----------------------------------------------------
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "WAITING EXACTLY 2 MINUTES"
-          Write-Host "120 seconds"
-          Write-Host "========================================"
-          Write-Host ""
+          $process = Get-Process `
+              -Name "Avica" `
+              -ErrorAction SilentlyContinue
 
-          Start-Sleep -Seconds 120
+          if ($process) {
+              Write-Host "Avica process is running."
+          }
+          else {
+              Write-Warning "Avica process was not detected."
+          }
 
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "120 SECONDS COMPLETED"
-          Write-Host "Moving to screenshot..."
-          Write-Host "========================================"
-          Write-Host ""
+          Write-Host "Waiting for Avica GUI..."
+          Start-Sleep -Seconds 20
 
       # =========================================================
-      # 5. TAKE SCREENSHOT
+      # 6. Make sure Avica is foreground / visible
       # =========================================================
-      - name: Take Avica Screenshot
-        shell: pwsh
+      - name: Prepare Avica Window
         run: |
-          Write-Host "========================================"
-          Write-Host "Taking Screenshot"
-          Write-Host "========================================"
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+
+          public class Win32 {
+              [DllImport("user32.dll")]
+              public static extern bool ShowWindow(
+                  IntPtr hWnd,
+                  int nCmdShow
+              );
+
+              [DllImport("user32.dll")]
+              public static extern bool SetForegroundWindow(
+                  IntPtr hWnd
+              );
+          }
+          "@
+
+          $process = Get-Process `
+              -Name "Avica" `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $_.MainWindowHandle -ne 0
+              } |
+              Select-Object -First 1
+
+          if ($process) {
+
+              Write-Host "Avica window found."
+
+              [Win32]::ShowWindow(
+                  $process.MainWindowHandle,
+                  5
+              )
+
+              [Win32]::SetForegroundWindow(
+                  $process.MainWindowHandle
+              )
+
+              Start-Sleep -Seconds 5
+
+          }
+          else {
+
+              Write-Warning "Avica main window was not found."
+              Write-Warning "The screenshot will still be captured."
+          }
+
+      # =========================================================
+      # 7. Take Full Desktop Screenshot
+      # =========================================================
+      - name: Capture Avica Screenshot
+        run: |
 
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
 
+          Write-Host "Detecting display..."
+
           $screens = [System.Windows.Forms.Screen]::AllScreens
 
-          if (!$screens -or $screens.Count -eq 0) {
-              Write-Error "No display detected."
-              exit 1
+          if ($screens.Count -eq 0) {
+              throw "No display was detected."
           }
 
-          $screen = $screens[0]
+          Write-Host "Displays detected: $($screens.Count)"
+
+          # Use primary display.
+          $screen = [System.Windows.Forms.Screen]::PrimaryScreen
 
           $bounds = $screen.Bounds
 
           Write-Host "Screen:"
+          Write-Host "X      : $($bounds.X)"
+          Write-Host "Y      : $($bounds.Y)"
           Write-Host "Width  : $($bounds.Width)"
           Write-Host "Height : $($bounds.Height)"
 
           $bitmap = New-Object `
-            System.Drawing.Bitmap `
-            $bounds.Width,
-            $bounds.Height
+              System.Drawing.Bitmap `
+              $bounds.Width,
+              $bounds.Height
 
           $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 
           $graphics.CopyFromScreen(
-              $bounds.Location,
-              [System.Drawing.Point]::Empty,
-              $bounds.Size
+              $bounds.X,
+              $bounds.Y,
+              0,
+              0,
+              $bounds.Size,
+              [System.Drawing.CopyPixelOperation]::SourceCopy
           )
 
-          $screenshotPath = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            "avica-screen.png"
+          $screenshot = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "avica-screen.png"
 
           $bitmap.Save(
-              $screenshotPath,
+              $screenshot,
               [System.Drawing.Imaging.ImageFormat]::Png
           )
 
           $graphics.Dispose()
           $bitmap.Dispose()
 
-          Write-Host ""
-          Write-Host "Screenshot saved:"
-          Write-Host $screenshotPath
-
-          if (!(Test-Path $screenshotPath)) {
-              Write-Error "Screenshot was not created."
-              exit 1
+          if (!(Test-Path $screenshot)) {
+              throw "Screenshot was not created."
           }
 
-          $screenshotInfo = Get-Item $screenshotPath
-
           Write-Host ""
-          Write-Host "Screenshot size: $($screenshotInfo.Length) bytes"
-          Write-Host "Screenshot completed."
+          Write-Host "=========================================="
+          Write-Host "Screenshot created:"
+          Write-Host $screenshot
+          Write-Host "=========================================="
+          Write-Host ""
 
       # =========================================================
-      # 6. UPLOAD SCREENSHOT
+      # 8. Upload Screenshot
       # =========================================================
       - name: Upload Avica Screenshot
         uses: actions/upload-artifact@v4
         with:
-          name: Avica-Connection-Screenshot
+          name: AVICA-CONNECTION-SCREEN
           path: avica-screen.png
           if-no-files-found: error
           retention-days: 1
 
       # =========================================================
-      # 7. KEEP RUNNER ALIVE
+      # 9. Show connection information
       # =========================================================
-      - name: Maintain RDP Session
-        shell: pwsh
+      - name: Show Session Information
         run: |
           Write-Host ""
-          Write-Host "========================================"
-          Write-Host "RDP + AVICA SESSION ACTIVE"
-          Write-Host "========================================"
+          Write-Host "===================================================="
+          Write-Host "              AVICA WINDOWS SESSION"
+          Write-Host "===================================================="
           Write-Host ""
-          Write-Host "RDP Username: RDP"
+          Write-Host "Avica has been installed and started."
           Write-Host ""
-          Write-Host "Avica screenshot has been uploaded."
-          Write-Host "Artifact: Avica-Connection-Screenshot"
+          Write-Host "The screenshot is available as:"
+          Write-Host "AVICA-CONNECTION-SCREEN"
           Write-Host ""
-          Write-Host "Runner will remain active."
-          Write-Host "========================================"
+          Write-Host "Open the Artifact and inspect the Avica window."
+          Write-Host ""
+          Write-Host "RDP Username: $env:RDP_USERNAME"
+          Write-Host "RDP Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "===================================================="
+
+      # =========================================================
+      # 10. Keep Runner Alive
+      # =========================================================
+      - name: Keep Avica Running
+        run: |
+
+          Write-Host ""
+          Write-Host "Avica session is active."
+          Write-Host "Runner will remain alive."
           Write-Host ""
 
           while ($true) {
 
               $avicaProcess = Get-Process `
-                -Name "Avica" `
-                -ErrorAction SilentlyContinue
+                  -Name "Avica" `
+                  -ErrorAction SilentlyContinue
 
               if ($avicaProcess) {
-                  Write-Host "[$(Get-Date)] Avica is running."
+
+                  Write-Host `
+                      "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Avica is running."
+
               }
               else {
-                  Write-Warning "[$(Get-Date)] Avica is not running."
+
+                  Write-Warning `
+                      "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Avica process is NOT running."
               }
 
-              Start-Sleep -Seconds 300
+              Start-Sleep -Seconds 60
           }
